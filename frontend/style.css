@@ -1,0 +1,47 @@
+body {
+  font-family: Arial;
+  background: linear-gradient(135deg, #6a82fb, #fc5c7d);
+  color: white;
+  text-align: center;
+}
+
+.container {
+  width: 400px;
+  margin: auto;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+input, select, button {
+  padding: 10px;
+  border-radius: 8px;
+  border: none;
+}
+
+button {
+  cursor: pointer;
+}
+
+#resultCard {
+  margin-top: 20px;
+  background: white;
+  color: black;
+  padding: 15px;
+  border-radius: 10px;
+}
+
+.progress-bar {
+  width: 100%;
+  background: #ddd;
+  height: 10px;
+  border-radius: 5px;
+}
+
+.progress-inner {
+  height: 10px;
+  border-radius: 5px;
+}

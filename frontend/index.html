@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Customer Churn AI Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="container">
+  <h1>Customer Churn AI Dashboard</h1>
+
+  <form id="churnForm">
+
+    <select name="gender" required>
+      <option value="">Gender</option>
+      <option>Male</option>
+      <option>Female</option>
+    </select>
+
+    <select name="SeniorCitizen" required>
+      <option value="">Senior Citizen</option>
+      <option value="0">No</option>
+      <option value="1">Yes</option>
+    </select>
+
+    <select name="Partner" required>
+      <option value="">Partner</option>
+      <option>Yes</option>
+      <option>No</option>
+    </select>
+
+    <select name="Dependents" required>
+      <option value="">Dependents</option>
+      <option>Yes</option>
+      <option>No</option>
+    </select>
+
+    <input type="number" name="tenure" placeholder="Tenure" required>
+
+    <select name="InternetService" required>
+      <option value="">Internet Service</option>
+      <option>DSL</option>
+      <option>Fiber optic</option>
+      <option>No</option>
+    </select>
+
+    <select name="Contract" required>
+      <option value="">Contract</option>
+      <option>Month-to-month</option>
+      <option>One year</option>
+      <option>Two year</option>
+    </select>
+
+    <input type="number" id="MonthlyCharges" name="MonthlyCharges" placeholder="Monthly Charges" min="0" step="0.01" required>
+    <input type="number" id="TotalCharges" name="TotalCharges" placeholder="Total Charges" min="0" step="0.01" required>
+
+    <button type="submit">Predict</button>
+    <button type="button" id="explainBtn">Explain</button>
+    <button type="button" id="trainBtn">Train</button>
+
+  </form>
+
+  <div id="loading">Loading...</div>
+  <div id="resultCard"></div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

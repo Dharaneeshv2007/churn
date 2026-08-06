@@ -322,3 +322,43 @@ If you found this project useful:
 Made with ❤️ using TensorFlow, Keras, Flask & Explainable AI
 
 </div>
+
+---
+
+## Backend Deployment Guide
+
+This folder now contains the complete Flask backend for production deployment on Render.
+
+### Installation
+
+```bash
+cd backend
+pip install -r requirements.txt
+```
+
+### Run Locally
+
+```bash
+cd backend
+python app.py
+```
+
+### Render Deployment
+
+Use this start command:
+
+```bash
+gunicorn app:app
+```
+
+The backend expects its assets relative to the backend folder:
+
+- Dataset: `data/churnprediction.csv`
+- Model: `saved_models/best_model.h5`
+- Scaler: `saved_models/scaler.pkl`
+- Encoder: `saved_models/encoder.pkl`
+
+### API Endpoints
+
+- `POST /predict` - returns churn probability, risk level, CLV, explanations, and recommendation
+- `POST /train` - retrains the LSTM/GRU models and saves the best model artifacts

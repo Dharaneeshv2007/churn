@@ -1,26 +1,34 @@
 import os
-import numpy as np
-import pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import joblib
+import pandas as pd
+from tensorflow.keras.models import load_model
 
 from utils.preprocessing import preprocess_data, load_and_prepare_data
-from utils.shap_explainer import get_shap_values
+from utils.shap_explainer import get_shap_values, build_prediction_explanation
 from utils.recommendation import get_recommendation
 from utils.clv import calculate_clv
 
 from model.lstm_model import build_lstm_model, train_lstm_model, evaluate_model as eval_lstm
 from model.gru_model import build_gru_model, train_gru_model, evaluate_model as eval_gru
 
-from tensorflow.keras.models import load_model
-
 app = Flask(__name__)
 CORS(app)
 
-MODEL_PATH = 'saved_models/best_model.h5'
-SCALER_PATH = 'saved_models/scaler.pkl'
-ENCODER_PATH = 'saved_models/encoder.pkl'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, 'data', 'churnprediction.csv')
+MODEL_DIR = os.path.join(BASE_DIR, 'saved_models')
+MODEL_PATH = os.path.join(MODEL_DIR, 'best_model.h5')
+SCALER_PATH = os.path.join(MODEL_DIR, 'scaler.pkl')
+ENCODER_PATH = os.path.join(MODEL_DIR, 'encoder.pkl')
+
+REFERENCE_DATA = load_and_prepare_data(DATA_PATH)
+REFERENCE_STATS = {
+    "MonthlyCharges": float(REFERENCE_DATA["MonthlyCharges"].mean()),
+    "tenure": float(REFERENCE_DATA["tenure"].median()),
+    "TotalCharges": float(REFERENCE_DATA["TotalCharges"].mean()),
+}
 
 
 @app.route("/")
@@ -33,9 +41,9 @@ def home():
 # =========================
 @app.route('/train', methods=['GET'])
 def train():
-    df = load_and_prepare_data("D:/HCL/churnprediction.csv")
+    df = load_and_prepare_data(DATA_PATH)
 
-    X, y, scaler, encoder, feature_names = preprocess_data(df, fit=True)
+    X, y, scaler, encoder, _feature_names = preprocess_data(df, fit=True)
 
     # Train LSTM
     lstm_model = build_lstm_model(X.shape[1])
@@ -56,7 +64,7 @@ def train():
         best_metrics = gru_metrics
 
     # Save models
-    os.makedirs("saved_models", exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
     best_model.save(MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     joblib.dump(encoder, ENCODER_PATH)
@@ -119,8 +127,22 @@ def predict():
 
         # SHAP explanation
         try:
-            top_reasons = get_shap_values(model, X, feature_names)
-        except:
+            prediction_explanation = build_prediction_explanation(
+                model,
+                X,
+                feature_names,
+                input_data=data,
+                reference_stats=REFERENCE_STATS,
+            )
+            top_reasons = prediction_explanation.get("top_reasons", get_shap_values(model, X, feature_names))
+        except (TypeError, ValueError, RuntimeError):
+            prediction_explanation = {
+                "summary": "Fallback explanation generated because SHAP could not be computed.",
+                "positive_factors": [],
+                "negative_factors": [],
+                "final_reason": "The model produced a valid prediction, but the explanation could not be generated.",
+                "top_reasons": ["High MonthlyCharges", "Low tenure"],
+            }
             top_reasons = ["High MonthlyCharges", "Low tenure"]
 
         action = get_recommendation(risk)
@@ -130,11 +152,13 @@ def predict():
             "risk_level": risk,
             "time_to_churn": time_to_churn,
             "customer_value": clv,
+            "recommendation": action,
             "top_reasons": top_reasons,
-            "recommended_action": action
+            "recommended_action": action,
+            "prediction_explanation": prediction_explanation
         })
 
-    except Exception as e:
+    except (TypeError, ValueError, RuntimeError, OSError) as e:
         print("❌ ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
 
@@ -162,16 +186,23 @@ def explain():
 
         model = load_model(MODEL_PATH)
 
-        shap_values = get_shap_values(
-            model, X, feature_names, return_full=True
+        prediction_explanation = build_prediction_explanation(
+            model,
+            X,
+            feature_names,
+            input_data=data,
+            reference_stats=REFERENCE_STATS,
         )
+
+        shap_values = get_shap_values(model, X, feature_names, return_full=True)
 
         return jsonify({
             "message": "Explanation generated",
-            "shap_values": shap_values
+            "shap_values": shap_values,
+            "prediction_explanation": prediction_explanation
         })
 
-    except Exception as e:
+    except (TypeError, ValueError, RuntimeError, OSError) as e:
         print("❌ EXPLAIN ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
 

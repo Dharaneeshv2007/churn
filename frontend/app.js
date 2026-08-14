@@ -18,7 +18,7 @@ form.addEventListener("submit", async (e) => {
     data.MonthlyCharges = Number(data.MonthlyCharges);
     data.TotalCharges = Number(data.TotalCharges);
 
-    const res = await fetch("http://127.0.0.1:5000/predict", {
+    const res = await fetch("https://churn-dki6.onrender.com/predict", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(data)

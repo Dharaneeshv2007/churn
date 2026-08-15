@@ -1,60 +1,108 @@
+const API_URL = "https://churn-dki6.onrender.com";
+
 const form = document.getElementById("churnForm");
 const resultDiv = document.getElementById("resultCard");
 const loading = document.getElementById("loading");
 
-// -------------------
+
+// ======================================================
 // PREDICT
-// -------------------
+// ======================================================
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
+
   loading.style.display = "block";
   resultDiv.innerHTML = "";
 
   try {
+    // Get form data
     const data = Object.fromEntries(new FormData(form));
 
-    // convert numbers
+    // Convert numeric values
     data.tenure = Number(data.tenure);
     data.MonthlyCharges = Number(data.MonthlyCharges);
     data.TotalCharges = Number(data.TotalCharges);
 
-    const res = await fetch("https://churn-dki6.onrender.com/predict", {
+    console.log("📤 Sending prediction data:", data);
+
+    // Send request to Render backend
+    const res = await fetch(`${API_URL}/predict`, {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify(data)
     });
 
-    if (!res.ok) throw new Error("Prediction failed");
+    console.log("📥 Prediction response status:", res.status);
 
-    const result = await res.json();
+    // Read response
+    const responseText = await res.text();
+
+    console.log("📥 Backend response:", responseText);
+
+    // Check HTTP status
+    if (!res.ok) {
+      throw new Error(
+        `Backend returned ${res.status}: ${responseText}`
+      );
+    }
+
+    // Convert response to JSON
+    const result = JSON.parse(responseText);
+
+    console.log("✅ Prediction result:", result);
+
+    // Display result
     showResult(result);
 
   } catch (err) {
-    alert("❌ Backend error or not running");
-    console.error(err);
-  }
+    console.error("❌ Prediction error:", err);
 
-  loading.style.display = "none";
+    resultDiv.innerHTML = `
+      <div class="error-card">
+        <h3>❌ Prediction Failed</h3>
+        <p>${err.message}</p>
+        <p>Please check whether the backend is running on Render.</p>
+      </div>
+    `;
+
+    alert("❌ Prediction failed. Check the browser Console for details.");
+
+  } finally {
+    loading.style.display = "none";
+  }
 });
 
 
-// -------------------
-// CLEAN TOP REASONS (🔥 IMPORTANT FIX)
-// -------------------
+// ======================================================
+// CLEAN TOP REASONS
+// ======================================================
+
 function cleanReasons(reasons) {
-  if (!reasons) return [];
+
+  if (!reasons || !Array.isArray(reasons)) {
+    return [];
+  }
 
   return reasons.map(r => {
 
-    // Handle Contract properly
-    if (r.includes("Contract_Month-to-month"))
+    // Make sure the value is a string
+    r = String(r);
+
+    // Contract handling
+    if (r.includes("Contract_Month-to-month")) {
       return "Contract: Month-to-month (High churn risk)";
+    }
 
-    if (r.includes("Contract_One year"))
+    if (r.includes("Contract_One year")) {
       return "Contract: One year (Moderate stability)";
+    }
 
-    if (r.includes("Contract_Two year"))
+    if (r.includes("Contract_Two year")) {
       return "Contract: Two year (Low churn risk)";
+    }
 
     // General cleanup
     return r.replace(/_/g, " : ");
@@ -62,81 +110,177 @@ function cleanReasons(reasons) {
 }
 
 
-// -------------------
+// ======================================================
 // SHOW RESULT
-// -------------------
+// ======================================================
+
 function showResult(data) {
 
-  let percent = Math.round((data.churn_probability || 0) * 100);
+  console.log("📊 Showing result:", data);
+
+  const probability = Number(data.churn_probability || 0);
+
+  const percent = Math.round(probability * 100);
 
   // Color logic
   let color = "green";
-  if (percent > 70) color = "red";
-  else if (percent > 40) color = "orange";
 
+  if (percent > 70) {
+    color = "red";
+  } else if (percent > 40) {
+    color = "orange";
+  }
+
+  // Get top reasons
   const reasonsList = cleanReasons(data.top_reasons);
 
-  let reasonsHTML = reasonsList.map(r => `<li>${r}</li>`).join("");
+  let reasonsHTML = "";
 
+  if (reasonsList.length > 0) {
+
+    reasonsHTML = reasonsList
+      .map(reason => `<li>${reason}</li>`)
+      .join("");
+
+  } else {
+
+    reasonsHTML = "<li>No specific reasons available</li>";
+  }
+
+
+  // Display result
   resultDiv.innerHTML = `
-    <h2>Prediction Result</h2>
+    <div class="prediction-result">
 
-    <div class="progress-bar">
-      <div class="progress-inner" 
-           style="width:${percent}%; background:${color}">
+      <h2>Prediction Result</h2>
+
+      <div class="progress-bar">
+        <div
+          class="progress-inner"
+          style="width:${percent}%; background:${color};">
+        </div>
       </div>
+
+      <p>
+        <b>Churn Probability:</b>
+        ${percent}%
+      </p>
+
+      <p>
+        <b>Risk Level:</b>
+        ${data.risk_level || "Unknown"}
+      </p>
+
+      <p>
+        <b>Time to Churn:</b>
+        ${data.time_to_churn || "Not available"}
+      </p>
+
+      <p>
+        <b>Customer Value:</b>
+        ${data.customer_value || "Unknown"}
+      </p>
+
+      <p>
+        <b>Recommended Action:</b>
+        ${data.recommended_action || "No recommendation available"}
+      </p>
+
+      <h3>Top Reasons</h3>
+
+      <ul>
+        ${reasonsHTML}
+      </ul>
+
     </div>
-
-    <p><b>Churn Probability:</b> ${percent}%</p>
-    <p><b>Risk Level:</b> ${data.risk_level}</p>
-    <p><b>Time to Churn:</b> ${data.time_to_churn}</p>
-    <p><b>Customer Value:</b> ${data.customer_value}</p>
-    <p><b>Recommended Action:</b> ${data.recommended_action}</p>
-
-    <h3>Top Reasons</h3>
-    <ul>${reasonsHTML}</ul>
   `;
 }
 
 
-// -------------------
+// ======================================================
 // EXPLAIN
-// -------------------
+// ======================================================
+
 document.getElementById("explainBtn").onclick = async () => {
 
   try {
+
     const data = Object.fromEntries(new FormData(form));
 
-    const res = await fetch("http://127.0.0.1:5000/explain", {
+    // Convert numbers
+    data.tenure = Number(data.tenure);
+    data.MonthlyCharges = Number(data.MonthlyCharges);
+    data.TotalCharges = Number(data.TotalCharges);
+
+    console.log("📤 Sending explain request:", data);
+
+    const res = await fetch(`${API_URL}/explain`, {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify(data)
     });
 
-    if (!res.ok) throw new Error("Explain failed");
+    console.log("📥 Explain response status:", res.status);
 
-    const result = await res.json();
+    const responseText = await res.text();
+
+    console.log("📥 Explain backend response:", responseText);
+
+    if (!res.ok) {
+      throw new Error(
+        `Explain failed with ${res.status}: ${responseText}`
+      );
+    }
+
+    const result = JSON.parse(responseText);
 
     console.log("🔍 SHAP Values:", result);
-    alert("Explanation printed in console");
+
+    alert("✅ Explanation generated successfully! Check the browser Console.");
 
   } catch (err) {
-    alert("❌ Explain failed");
-    console.error(err);
+
+    console.error("❌ Explain error:", err);
+
+    alert(`❌ Explain failed: ${err.message}`);
   }
 };
 
 
-// -------------------
+// ======================================================
 // TRAIN
-// -------------------
+// ======================================================
+
 document.getElementById("trainBtn").onclick = async () => {
 
   try {
-    await fetch("http://127.0.0.1:5000/train");
+
+    console.log("📤 Sending training request...");
+
+    const res = await fetch(`${API_URL}/train`, {
+      method: "GET"
+    });
+
+    console.log("📥 Train response status:", res.status);
+
+    const responseText = await res.text();
+
+    console.log("📥 Train backend response:", responseText);
+
+    if (!res.ok) {
+      throw new Error(
+        `Training failed with ${res.status}: ${responseText}`
+      );
+    }
+
     alert("✅ Model Trained Successfully!");
+
   } catch (err) {
-    alert("❌ Training failed");
-    console.error(err);
+
+    console.error("❌ Training error:", err);
+
+    alert(`❌ Training failed: ${err.message}`);
   }
 };

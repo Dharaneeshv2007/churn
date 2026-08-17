@@ -2,69 +2,128 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Customer Churn AI Dashboard</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div class="page-shell">
+    <header class="hero">
+      <p class="hero-kicker">AI CUSTOMER ANALYTICS</p>
+      <h1>Customer Churn AI</h1>
+      <p class="hero-subtitle">AI-powered customer retention and churn prediction</p>
+    </header>
 
-<div class="container">
-  <h1>Customer Churn AI Dashboard</h1>
+    <main class="dashboard-grid">
+      <section class="panel form-panel">
+        <div class="panel-header">
+          <h2>Customer Information</h2>
+          <p>Enter customer details to estimate churn risk.</p>
+        </div>
 
-  <form id="churnForm">
+        <form id="churnForm" novalidate>
+          <div class="fields-grid">
+            <div class="field">
+              <label for="gender">Gender</label>
+              <select id="gender" name="gender" required>
+                <option value="" selected disabled>Select gender</option>
+                <option>Male</option>
+                <option>Female</option>
+              </select>
+            </div>
 
-    <select name="gender" required>
-      <option value="">Gender</option>
-      <option>Male</option>
-      <option>Female</option>
-    </select>
+            <div class="field">
+              <label for="seniorCitizen">Senior Citizen</label>
+              <select id="seniorCitizen" name="SeniorCitizen" required>
+                <option value="" selected disabled>Select option</option>
+                <option value="0">No</option>
+                <option value="1">Yes</option>
+              </select>
+            </div>
 
-    <select name="SeniorCitizen" required>
-      <option value="">Senior Citizen</option>
-      <option value="0">No</option>
-      <option value="1">Yes</option>
-    </select>
+            <div class="field">
+              <label for="partner">Partner</label>
+              <select id="partner" name="Partner" required>
+                <option value="" selected disabled>Select option</option>
+                <option>Yes</option>
+                <option>No</option>
+              </select>
+            </div>
 
-    <select name="Partner" required>
-      <option value="">Partner</option>
-      <option>Yes</option>
-      <option>No</option>
-    </select>
+            <div class="field">
+              <label for="dependents">Dependents</label>
+              <select id="dependents" name="Dependents" required>
+                <option value="" selected disabled>Select option</option>
+                <option>Yes</option>
+                <option>No</option>
+              </select>
+            </div>
 
-    <select name="Dependents" required>
-      <option value="">Dependents</option>
-      <option>Yes</option>
-      <option>No</option>
-    </select>
+            <div class="field">
+              <label for="tenure">Tenure (months)</label>
+              <input type="number" id="tenure" name="tenure" min="0" step="1" required>
+            </div>
 
-    <input type="number" name="tenure" placeholder="Tenure" required>
+            <div class="field">
+              <label for="internetService">Internet Service</label>
+              <select id="internetService" name="InternetService" required>
+                <option value="" selected disabled>Select service</option>
+                <option>DSL</option>
+                <option>Fiber optic</option>
+                <option>No</option>
+              </select>
+            </div>
 
-    <select name="InternetService" required>
-      <option value="">Internet Service</option>
-      <option>DSL</option>
-      <option>Fiber optic</option>
-      <option>No</option>
-    </select>
+            <div class="field">
+              <label for="contract">Contract</label>
+              <select id="contract" name="Contract" required>
+                <option value="" selected disabled>Select contract</option>
+                <option>Month-to-month</option>
+                <option>One year</option>
+                <option>Two year</option>
+              </select>
+            </div>
 
-    <select name="Contract" required>
-      <option value="">Contract</option>
-      <option>Month-to-month</option>
-      <option>One year</option>
-      <option>Two year</option>
-    </select>
+            <div class="field">
+              <label for="MonthlyCharges">Monthly Charges</label>
+              <input type="number" id="MonthlyCharges" name="MonthlyCharges" min="0" step="0.01" required>
+            </div>
 
-    <input type="number" id="MonthlyCharges" name="MonthlyCharges" placeholder="Monthly Charges" min="0" step="0.01" required>
-    <input type="number" id="TotalCharges" name="TotalCharges" placeholder="Total Charges" min="0" step="0.01" required>
+            <div class="field field-wide">
+              <label for="TotalCharges">Total Charges</label>
+              <input type="number" id="TotalCharges" name="TotalCharges" min="0" step="0.01" required>
+            </div>
+          </div>
 
-    <button type="submit">Predict</button>
-    <button type="button" id="explainBtn">Explain</button>
-    <button type="button" id="trainBtn">Train</button>
+          <div class="actions-row">
+            <button type="submit" id="predictBtn" class="btn btn-primary">Predict Churn</button>
+            <button type="button" id="explainBtn" class="btn btn-secondary">Explain Prediction</button>
+          </div>
+        </form>
 
-  </form>
+        <div id="loading" class="loading-state" aria-live="polite" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="loadingText">Analyzing customer data...</span>
+        </div>
+      </section>
 
-  <div id="loading">Loading...</div>
-  <div id="resultCard"></div>
+      <section class="result-stack">
+        <article id="resultCard" class="panel result-panel" aria-live="polite">
+          <div class="panel-header">
+            <h2>Churn Risk Result</h2>
+            <p>Ready for prediction.</p>
+          </div>
+        </article>
 
-</div>
+        <article id="explanationCard" class="panel explanation-panel" aria-live="polite">
+          <div class="panel-header">
+            <h2>Prediction Explanation</h2>
+            <p>Run Explain Prediction to view model reasoning.</p>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
 
 <script src="app.js"></script>
 </body>

@@ -1,12 +1,19 @@
+import logging
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+
 import joblib
+import numpy as np
 import pandas as pd
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from tensorflow.keras.models import load_model
 
 from utils.preprocessing import preprocess_data, load_and_prepare_data
-from utils.shap_explainer import get_shap_values, build_prediction_explanation
+from utils.shap_explainer import (
+    SHAP_BACKGROUND_SIZE,
+    ShapExplanationError,
+    build_prediction_explanation,
+)
 from utils.recommendation import get_recommendation
 from utils.clv import calculate_clv
 
@@ -14,7 +21,24 @@ from model.lstm_model import build_lstm_model, train_lstm_model, evaluate_model 
 from model.gru_model import build_gru_model, train_gru_model, evaluate_model as eval_gru
 
 app = Flask(__name__)
-CORS(app)
+
+default_frontend_origins = {
+    "https://churn-56cwmaynb-dharaneesh-s-projects4.vercel.app"
+}
+configured_frontend_origins = {
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+}
+allowed_origins = sorted(default_frontend_origins | configured_frontend_origins)
+
+CORS(
+    app,
+    resources={r"/*": {"origins": allowed_origins}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, 'data', 'churnprediction.csv')
@@ -29,6 +53,52 @@ REFERENCE_STATS = {
     "tenure": float(REFERENCE_DATA["tenure"].median()),
     "TotalCharges": float(REFERENCE_DATA["TotalCharges"].mean()),
 }
+
+
+def _validate_customer(data, encoder):
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Request body must be a non-empty JSON object")
+
+    required = {
+        'gender', 'SeniorCitizen', 'Partner', 'Dependents', 'tenure',
+        'InternetService', 'Contract', 'MonthlyCharges', 'TotalCharges',
+    }
+    missing = sorted(required - data.keys())
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+    for name in ('SeniorCitizen', 'tenure', 'MonthlyCharges', 'TotalCharges'):
+        try:
+            value = float(data[name])
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be numeric") from None
+        if not np.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+
+    categorical_names = ('gender', 'Partner', 'Dependents', 'InternetService', 'Contract')
+    for index, name in enumerate(categorical_names):
+        if data[name] not in encoder.categories_[index]:
+            raise ValueError(f"Unknown value for {name}: {data[name]}")
+
+
+def _load_customer_context(data):
+    scaler = joblib.load(SCALER_PATH)
+    encoder = joblib.load(ENCODER_PATH)
+    _validate_customer(data, encoder)
+    X, _, _, _, feature_names = preprocess_data(
+        pd.DataFrame([data]), fit=False, scaler=scaler, encoder=encoder
+    )
+    reference_X, _, _, _, _ = preprocess_data(
+        REFERENCE_DATA, fit=False, scaler=scaler, encoder=encoder
+    )
+    return X, reference_X[:SHAP_BACKGROUND_SIZE], feature_names
+
+
+def _predict_probability(model, X):
+    model_input = X
+    if len(getattr(model, 'input_shape', ())) == 3 and X.ndim == 2:
+        model_input = X.reshape(X.shape[0], X.shape[1], 1)
+    return float(np.asarray(model.predict(model_input, verbose=0)).reshape(-1)[0])
 
 
 @app.route("/")
@@ -81,27 +151,15 @@ def train():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        print("🔥 Predict API called")
-
-        data = request.json
-        print("Input:", data)
+        data = request.get_json(silent=True)
 
         if not os.path.exists(MODEL_PATH):
             return jsonify({"error": "Model not trained. Call /train first"}), 400
 
-        df = pd.DataFrame([data])
-
-        scaler = joblib.load(SCALER_PATH)
-        encoder = joblib.load(ENCODER_PATH)
-
-        X, _, _, _, feature_names = preprocess_data(
-            df, fit=False, scaler=scaler, encoder=encoder
-        )
+        X, background_X, feature_names = _load_customer_context(data)
 
         model = load_model(MODEL_PATH)
-
-        prob = float(model.predict(X)[0][0])
-        print("Prediction:", prob)
+        prob = _predict_probability(model, X)
 
         # Risk level
         if prob < 0.4:
@@ -133,17 +191,13 @@ def predict():
                 feature_names,
                 input_data=data,
                 reference_stats=REFERENCE_STATS,
+                background_X=background_X,
             )
-            top_reasons = prediction_explanation.get("top_reasons", get_shap_values(model, X, feature_names))
-        except (TypeError, ValueError, RuntimeError):
-            prediction_explanation = {
-                "summary": "Fallback explanation generated because SHAP could not be computed.",
-                "positive_factors": [],
-                "negative_factors": [],
-                "final_reason": "The model produced a valid prediction, but the explanation could not be generated.",
-                "top_reasons": ["High MonthlyCharges", "Low tenure"],
-            }
-            top_reasons = ["High MonthlyCharges", "Low tenure"]
+            top_reasons = prediction_explanation["top_reasons"]
+        except ShapExplanationError as error:
+            logger.exception("SHAP explanation failed during prediction")
+            prediction_explanation = {"error": str(error)}
+            top_reasons = []
 
         action = get_recommendation(risk)
 
@@ -158,9 +212,11 @@ def predict():
             "prediction_explanation": prediction_explanation
         })
 
-    except (TypeError, ValueError, RuntimeError, OSError) as e:
-        print("❌ ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except (TypeError, RuntimeError, OSError) as error:
+        logger.exception("Prediction endpoint failed")
+        return jsonify({"error": str(error)}), 500
 
 
 # =========================
@@ -169,20 +225,12 @@ def predict():
 @app.route('/explain', methods=['POST'])
 def explain():
     try:
-        data = request.json
-        print("🧠 Explain API called")
+        data = request.get_json(silent=True)
 
         if not os.path.exists(MODEL_PATH):
             return jsonify({"error": "Model not trained"}), 400
 
-        df = pd.DataFrame([data])
-
-        scaler = joblib.load(SCALER_PATH)
-        encoder = joblib.load(ENCODER_PATH)
-
-        X, _, _, _, feature_names = preprocess_data(
-            df, fit=False, scaler=scaler, encoder=encoder
-        )
+        X, background_X, feature_names = _load_customer_context(data)
 
         model = load_model(MODEL_PATH)
 
@@ -192,19 +240,23 @@ def explain():
             feature_names,
             input_data=data,
             reference_stats=REFERENCE_STATS,
+            background_X=background_X,
         )
-
-        shap_values = get_shap_values(model, X, feature_names, return_full=True)
 
         return jsonify({
             "message": "Explanation generated",
-            "shap_values": shap_values,
-            "prediction_explanation": prediction_explanation
+            "prediction_explanation": prediction_explanation,
+            **prediction_explanation,
         })
 
-    except (TypeError, ValueError, RuntimeError, OSError) as e:
-        print("❌ EXPLAIN ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except ShapExplanationError as error:
+        logger.exception("SHAP ERROR")
+        return jsonify({"error": "Unable to generate SHAP explanation", "details": str(error)}), 500
+    except (OSError, TypeError, RuntimeError) as error:
+        logger.exception("Explain endpoint failed")
+        return jsonify({"error": str(error)}), 500
 
 
 # =========================

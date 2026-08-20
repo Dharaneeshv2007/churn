@@ -34,6 +34,7 @@ from model.gru_model import (
 # ============================================================
 
 app = Flask(__name__)
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,77 +42,69 @@ logger = logging.getLogger(__name__)
 # CORS CONFIGURATION
 # ============================================================
 #
-# Current Vercel frontend:
-# https://churn-b2kwdxa1u-dharaneesh-s-projects4.vercel.app
+# The frontend is deployed on Vercel and its deployment URL can
+# change between deployments.
 #
-# Old Vercel frontend:
-# https://churn-56cwmaynb-dharaneesh-s-projects4.vercel.app
+# Therefore, during deployment/testing, allow CORS requests from
+# all origins.
 #
-# FRONTEND_ORIGINS can also be configured in Render environment
-# variables as a comma-separated list.
+# This fixes errors such as:
+#
+# "No 'Access-Control-Allow-Origin' header is present"
+#
 # ============================================================
-
-default_frontend_origins = {
-    "https://churn-b2kwdxa1u-dharaneesh-s-projects4.vercel.app",
-    "https://churn-56cwmaynb-dharaneesh-s-projects4.vercel.app",
-}
-
-configured_frontend_origins = {
-    origin.strip().rstrip("/")
-    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if origin.strip()
-}
-
-allowed_origins = sorted(
-    default_frontend_origins | configured_frontend_origins
-)
 
 CORS(
     app,
     resources={
         r"/*": {
-            "origins": allowed_origins
+            "origins": "*"
         }
     },
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    methods=[
+        "GET",
+        "POST",
+        "OPTIONS"
+    ],
+    allow_headers=[
+        "Content-Type",
+        "Authorization"
+    ],
 )
-
-
-# Optional logging so Render logs clearly show the configured origins
-logger.info("Allowed CORS origins: %s", allowed_origins)
 
 
 # ============================================================
 # PATH CONFIGURATION
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
 
 DATA_PATH = os.path.join(
     BASE_DIR,
     "data",
-    "churnprediction.csv",
+    "churnprediction.csv"
 )
 
 MODEL_DIR = os.path.join(
     BASE_DIR,
-    "saved_models",
+    "saved_models"
 )
 
 MODEL_PATH = os.path.join(
     MODEL_DIR,
-    "best_model.h5",
+    "best_model.h5"
 )
 
 SCALER_PATH = os.path.join(
     MODEL_DIR,
-    "scaler.pkl",
+    "scaler.pkl"
 )
 
 ENCODER_PATH = os.path.join(
     MODEL_DIR,
-    "encoder.pkl",
+    "encoder.pkl"
 )
 
 
@@ -119,15 +112,19 @@ ENCODER_PATH = os.path.join(
 # REFERENCE DATA
 # ============================================================
 
-REFERENCE_DATA = load_and_prepare_data(DATA_PATH)
+REFERENCE_DATA = load_and_prepare_data(
+    DATA_PATH
+)
 
 REFERENCE_STATS = {
     "MonthlyCharges": float(
         REFERENCE_DATA["MonthlyCharges"].mean()
     ),
+
     "tenure": float(
         REFERENCE_DATA["tenure"].median()
     ),
+
     "TotalCharges": float(
         REFERENCE_DATA["TotalCharges"].mean()
     ),
@@ -135,12 +132,13 @@ REFERENCE_STATS = {
 
 
 # ============================================================
-# VALIDATE CUSTOMER DATA
+# CUSTOMER VALIDATION
 # ============================================================
 
 def _validate_customer(data, encoder):
 
     if not isinstance(data, dict) or not data:
+
         raise ValueError(
             "Request body must be a non-empty JSON object"
         )
@@ -157,14 +155,20 @@ def _validate_customer(data, encoder):
         "TotalCharges",
     }
 
-    missing = sorted(required - data.keys())
+    missing = sorted(
+        required - data.keys()
+    )
 
     if missing:
+
         raise ValueError(
             f"Missing required fields: {', '.join(missing)}"
         )
 
+    # --------------------------------------------------------
     # Numeric validation
+    # --------------------------------------------------------
+
     for name in (
         "SeniorCitizen",
         "tenure",
@@ -173,18 +177,30 @@ def _validate_customer(data, encoder):
     ):
 
         try:
-            value = float(data[name])
-        except (TypeError, ValueError):
+
+            value = float(
+                data[name]
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
             raise ValueError(
                 f"{name} must be numeric"
             ) from None
 
         if not np.isfinite(value):
+
             raise ValueError(
                 f"{name} must be finite"
             )
 
+    # --------------------------------------------------------
     # Categorical validation
+    # --------------------------------------------------------
+
     categorical_names = (
         "gender",
         "Partner",
@@ -193,7 +209,9 @@ def _validate_customer(data, encoder):
         "Contract",
     )
 
-    for index, name in enumerate(categorical_names):
+    for index, name in enumerate(
+        categorical_names
+    ):
 
         if data[name] not in encoder.categories_[index]:
 
@@ -208,10 +226,18 @@ def _validate_customer(data, encoder):
 
 def _load_customer_context(data):
 
-    scaler = joblib.load(SCALER_PATH)
-    encoder = joblib.load(ENCODER_PATH)
+    scaler = joblib.load(
+        SCALER_PATH
+    )
 
-    _validate_customer(data, encoder)
+    encoder = joblib.load(
+        ENCODER_PATH
+    )
+
+    _validate_customer(
+        data,
+        encoder
+    )
 
     X, _, _, _, feature_names = preprocess_data(
         pd.DataFrame([data]),
@@ -242,24 +268,36 @@ def _predict_probability(model, X):
 
     model_input = X
 
-    # LSTM/GRU models expect 3D input
+    # --------------------------------------------------------
+    # LSTM / GRU models expect 3D input
+    # --------------------------------------------------------
+
     if (
-        len(getattr(model, "input_shape", ())) == 3
+        len(
+            getattr(
+                model,
+                "input_shape",
+                ()
+            )
+        ) == 3
         and X.ndim == 2
     ):
+
         model_input = X.reshape(
             X.shape[0],
             X.shape[1],
-            1,
+            1
         )
 
     prediction = model.predict(
         model_input,
-        verbose=0,
+        verbose=0
     )
 
     return float(
-        np.asarray(prediction).reshape(-1)[0]
+        np.asarray(
+            prediction
+        ).reshape(-1)[0]
     )
 
 
@@ -279,13 +317,17 @@ def home():
 # HEALTH CHECK
 # ============================================================
 
-@app.route("/health", methods=["GET"])
+@app.route(
+    "/health",
+    methods=["GET"]
+)
 def health():
 
     return jsonify({
         "status": "healthy",
-        "cors_origins": allowed_origins,
-        "model_exists": os.path.exists(MODEL_PATH),
+        "model_exists": os.path.exists(
+            MODEL_PATH
+        ),
     })
 
 
@@ -293,14 +335,19 @@ def health():
 # TRAIN
 # ============================================================
 
-@app.route("/train", methods=["GET"])
+@app.route(
+    "/train",
+    methods=["GET"]
+)
 def train():
 
-    df = load_and_prepare_data(DATA_PATH)
+    df = load_and_prepare_data(
+        DATA_PATH
+    )
 
     X, y, scaler, encoder, _feature_names = preprocess_data(
         df,
-        fit=True,
+        fit=True
     )
 
     # --------------------------------------------------------
@@ -314,13 +361,13 @@ def train():
     train_lstm_model(
         lstm_model,
         X,
-        y,
+        y
     )
 
     lstm_metrics = eval_lstm(
         lstm_model,
         X,
-        y,
+        y
     )
 
     # --------------------------------------------------------
@@ -334,17 +381,17 @@ def train():
     train_gru_model(
         gru_model,
         X,
-        y,
+        y
     )
 
     gru_metrics = eval_gru(
         gru_model,
         X,
-        y,
+        y
     )
 
     # --------------------------------------------------------
-    # Select Best Model
+    # Select best model
     # --------------------------------------------------------
 
     if lstm_metrics["f1"] >= gru_metrics["f1"]:
@@ -358,12 +405,12 @@ def train():
         best_metrics = gru_metrics
 
     # --------------------------------------------------------
-    # Save Model
+    # Save model
     # --------------------------------------------------------
 
     os.makedirs(
         MODEL_DIR,
-        exist_ok=True,
+        exist_ok=True
     )
 
     best_model.save(
@@ -372,17 +419,17 @@ def train():
 
     joblib.dump(
         scaler,
-        SCALER_PATH,
+        SCALER_PATH
     )
 
     joblib.dump(
         encoder,
-        ENCODER_PATH,
+        ENCODER_PATH
     )
 
     return jsonify({
         "status": "Model trained successfully",
-        "metrics": best_metrics,
+        "metrics": best_metrics
     })
 
 
@@ -392,17 +439,15 @@ def train():
 
 @app.route(
     "/predict",
-    methods=["POST", "OPTIONS"],
+    methods=[
+        "POST",
+        "OPTIONS"
+    ]
 )
 def predict():
 
     # --------------------------------------------------------
-    # Explicit OPTIONS response
-    # --------------------------------------------------------
-    #
-    # Flask-CORS normally handles this automatically, but
-    # explicitly supporting OPTIONS makes the endpoint robust
-    # against browser preflight requests.
+    # Handle browser CORS preflight request
     # --------------------------------------------------------
 
     if request.method == "OPTIONS":
@@ -411,28 +456,43 @@ def predict():
 
     try:
 
+        # ----------------------------------------------------
+        # Get JSON body
+        # ----------------------------------------------------
+
         data = request.get_json(
             silent=True
         )
 
-        if not os.path.exists(MODEL_PATH):
+        # ----------------------------------------------------
+        # Check model
+        # ----------------------------------------------------
+
+        if not os.path.exists(
+            MODEL_PATH
+        ):
 
             return jsonify({
-                "error": "Model not trained. Call /train first"
+                "error": (
+                    "Model not trained. "
+                    "Call /train first"
+                )
             }), 400
 
         # ----------------------------------------------------
-        # Prepare input
+        # Prepare customer data
         # ----------------------------------------------------
 
         (
             X,
             background_X,
-            feature_names,
-        ) = _load_customer_context(data)
+            feature_names
+        ) = _load_customer_context(
+            data
+        )
 
         # ----------------------------------------------------
-        # Load model
+        # Load trained model
         # ----------------------------------------------------
 
         model = load_model(
@@ -440,12 +500,12 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # Prediction
+        # Predict churn probability
         # ----------------------------------------------------
 
         prob = _predict_probability(
             model,
-            X,
+            X
         )
 
         # ----------------------------------------------------
@@ -485,12 +545,18 @@ def predict():
         # ----------------------------------------------------
 
         clv = calculate_clv(
-            data.get("tenure", 0),
-            data.get("MonthlyCharges", 0),
+            data.get(
+                "tenure",
+                0
+            ),
+            data.get(
+                "MonthlyCharges",
+                0
+            )
         )
 
         # ----------------------------------------------------
-        # SHAP Explanation
+        # SHAP explanation
         # ----------------------------------------------------
 
         try:
@@ -507,7 +573,9 @@ def predict():
             )
 
             top_reasons = (
-                prediction_explanation["top_reasons"]
+                prediction_explanation[
+                    "top_reasons"
+                ]
             )
 
         except ShapExplanationError as error:
@@ -531,14 +599,14 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # Response
+        # Return prediction
         # ----------------------------------------------------
 
         return jsonify({
 
             "churn_probability": round(
                 prob,
-                2,
+                2
             ),
 
             "risk_level": risk,
@@ -554,7 +622,7 @@ def predict():
             "recommended_action": action,
 
             "prediction_explanation":
-                prediction_explanation,
+                prediction_explanation
         })
 
     except ValueError as error:
@@ -566,7 +634,7 @@ def predict():
     except (
         TypeError,
         RuntimeError,
-        OSError,
+        OSError
     ) as error:
 
         logger.exception(
@@ -584,36 +652,54 @@ def predict():
 
 @app.route(
     "/explain",
-    methods=["POST", "OPTIONS"],
+    methods=[
+        "POST",
+        "OPTIONS"
+    ]
 )
 def explain():
 
-    # Explicit CORS preflight support
+    # --------------------------------------------------------
+    # Handle browser CORS preflight request
+    # --------------------------------------------------------
+
     if request.method == "OPTIONS":
 
         return "", 200
 
     try:
 
+        # ----------------------------------------------------
+        # Get JSON body
+        # ----------------------------------------------------
+
         data = request.get_json(
             silent=True
         )
 
-        if not os.path.exists(MODEL_PATH):
+        # ----------------------------------------------------
+        # Check model
+        # ----------------------------------------------------
+
+        if not os.path.exists(
+            MODEL_PATH
+        ):
 
             return jsonify({
                 "error": "Model not trained"
             }), 400
 
         # ----------------------------------------------------
-        # Prepare customer context
+        # Prepare customer data
         # ----------------------------------------------------
 
         (
             X,
             background_X,
-            feature_names,
-        ) = _load_customer_context(data)
+            feature_names
+        ) = _load_customer_context(
+            data
+        )
 
         # ----------------------------------------------------
         # Load model
@@ -645,7 +731,7 @@ def explain():
             "prediction_explanation":
                 prediction_explanation,
 
-            **prediction_explanation,
+            **prediction_explanation
         })
 
     except ValueError as error:
@@ -661,14 +747,17 @@ def explain():
         )
 
         return jsonify({
-            "error": "Unable to generate SHAP explanation",
-            "details": str(error),
+            "error": (
+                "Unable to generate "
+                "SHAP explanation"
+            ),
+            "details": str(error)
         }), 500
 
     except (
         OSError,
         TypeError,
-        RuntimeError,
+        RuntimeError
     ) as error:
 
         logger.exception(

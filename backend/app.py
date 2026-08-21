@@ -4,6 +4,7 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
@@ -22,6 +23,7 @@ from model.lstm_model import (
     train_lstm_model,
     evaluate_model as eval_lstm,
 )
+
 from model.gru_model import (
     build_gru_model,
     train_gru_model,
@@ -39,19 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CORS CONFIGURATION
-# ============================================================
-#
-# The frontend is deployed on Vercel and its deployment URL can
-# change between deployments.
-#
-# Therefore, during deployment/testing, allow CORS requests from
-# all origins.
-#
-# This fixes errors such as:
-#
-# "No 'Access-Control-Allow-Origin' header is present"
-#
+# CORS
 # ============================================================
 
 CORS(
@@ -138,7 +128,6 @@ REFERENCE_STATS = {
 def _validate_customer(data, encoder):
 
     if not isinstance(data, dict) or not data:
-
         raise ValueError(
             "Request body must be a non-empty JSON object"
         )
@@ -160,7 +149,6 @@ def _validate_customer(data, encoder):
     )
 
     if missing:
-
         raise ValueError(
             f"Missing required fields: {', '.join(missing)}"
         )
@@ -177,10 +165,7 @@ def _validate_customer(data, encoder):
     ):
 
         try:
-
-            value = float(
-                data[name]
-            )
+            value = float(data[name])
 
         except (
             TypeError,
@@ -192,7 +177,6 @@ def _validate_customer(data, encoder):
             ) from None
 
         if not np.isfinite(value):
-
             raise ValueError(
                 f"{name} must be finite"
             )
@@ -268,10 +252,7 @@ def _predict_probability(model, X):
 
     model_input = X
 
-    # --------------------------------------------------------
-    # LSTM / GRU models expect 3D input
-    # --------------------------------------------------------
-
+    # LSTM / GRU models expect 3D input.
     if (
         len(
             getattr(
@@ -435,6 +416,12 @@ def train():
 
 # ============================================================
 # PREDICT
+#
+# IMPORTANT:
+# /predict DOES NOT RUN SHAP.
+#
+# Prediction and explanation are intentionally separated.
+# This keeps prediction fast and prevents Gunicorn timeout.
 # ============================================================
 
 @app.route(
@@ -447,11 +434,10 @@ def train():
 def predict():
 
     # --------------------------------------------------------
-    # Handle browser CORS preflight request
+    # CORS preflight
     # --------------------------------------------------------
 
     if request.method == "OPTIONS":
-
         return "", 200
 
     try:
@@ -463,6 +449,11 @@ def predict():
         data = request.get_json(
             silent=True
         )
+
+        if not isinstance(data, dict) or not data:
+            return jsonify({
+                "error": "Request body must be a non-empty JSON object"
+            }), 400
 
         # ----------------------------------------------------
         # Check model
@@ -483,11 +474,7 @@ def predict():
         # Prepare customer data
         # ----------------------------------------------------
 
-        (
-            X,
-            background_X,
-            feature_names
-        ) = _load_customer_context(
+        X, _, _ = _load_customer_context(
             data
         )
 
@@ -500,12 +487,20 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # Predict churn probability
+        # Prediction ONLY
+        #
+        # NO SHAP HERE
         # ----------------------------------------------------
 
         prob = _predict_probability(
             model,
             X
+        )
+
+        # Safety clamp
+        prob = min(
+            max(prob, 0.0),
+            1.0
         )
 
         # ----------------------------------------------------
@@ -545,50 +540,9 @@ def predict():
         # ----------------------------------------------------
 
         clv = calculate_clv(
-            data.get(
-                "tenure",
-                0
-            ),
-            data.get(
-                "MonthlyCharges",
-                0
-            )
+            data.get("tenure", 0),
+            data.get("MonthlyCharges", 0)
         )
-
-        # ----------------------------------------------------
-        # SHAP explanation
-        # ----------------------------------------------------
-
-        try:
-
-            prediction_explanation = (
-                build_prediction_explanation(
-                    model,
-                    X,
-                    feature_names,
-                    input_data=data,
-                    reference_stats=REFERENCE_STATS,
-                    background_X=background_X,
-                )
-            )
-
-            top_reasons = (
-                prediction_explanation[
-                    "top_reasons"
-                ]
-            )
-
-        except ShapExplanationError as error:
-
-            logger.exception(
-                "SHAP explanation failed during prediction"
-            )
-
-            prediction_explanation = {
-                "error": str(error)
-            }
-
-            top_reasons = []
 
         # ----------------------------------------------------
         # Recommendation
@@ -599,14 +553,16 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # Return prediction
+        # RETURN ONLY PREDICTION RESULT
+        #
+        # SHAP is deliberately NOT included.
         # ----------------------------------------------------
 
         return jsonify({
 
             "churn_probability": round(
                 prob,
-                2
+                4
             ),
 
             "risk_level": risk,
@@ -617,12 +573,11 @@ def predict():
 
             "recommendation": action,
 
-            "top_reasons": top_reasons,
-
             "recommended_action": action,
 
-            "prediction_explanation":
-                prediction_explanation
+            "top_reasons": [],
+
+            "prediction_explanation": None
         })
 
     except ValueError as error:
@@ -645,9 +600,22 @@ def predict():
             "error": str(error)
         }), 500
 
+    except Exception as error:
+
+        logger.exception(
+            "Unexpected prediction error"
+        )
+
+        return jsonify({
+            "error": str(error)
+        }), 500
+
 
 # ============================================================
 # EXPLAIN
+#
+# IMPORTANT:
+# /explain is the ONLY endpoint that runs SHAP.
 # ============================================================
 
 @app.route(
@@ -660,11 +628,10 @@ def predict():
 def explain():
 
     # --------------------------------------------------------
-    # Handle browser CORS preflight request
+    # CORS preflight
     # --------------------------------------------------------
 
     if request.method == "OPTIONS":
-
         return "", 200
 
     try:
@@ -676,6 +643,11 @@ def explain():
         data = request.get_json(
             silent=True
         )
+
+        if not isinstance(data, dict) or not data:
+            return jsonify({
+                "error": "Request body must be a non-empty JSON object"
+            }), 400
 
         # ----------------------------------------------------
         # Check model
@@ -710,7 +682,9 @@ def explain():
         )
 
         # ----------------------------------------------------
-        # Generate explanation
+        # Generate SHAP explanation
+        #
+        # This is intentionally only here.
         # ----------------------------------------------------
 
         prediction_explanation = (
@@ -768,6 +742,16 @@ def explain():
             "error": str(error)
         }), 500
 
+    except Exception as error:
+
+        logger.exception(
+            "Unexpected explanation error"
+        )
+
+        return jsonify({
+            "error": str(error)
+        }), 500
+
 
 # ============================================================
 # RUN LOCALLY
@@ -775,6 +759,15 @@ def explain():
 
 if __name__ == "__main__":
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
     app.run(
+        host="0.0.0.0",
+        port=port,
         debug=True
     )

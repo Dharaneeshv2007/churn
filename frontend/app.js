@@ -3,22 +3,27 @@ const API_URL = "https://churn-dki6.onrender.com";
 const form = document.getElementById("churnForm");
 
 const resultDiv = document.getElementById("resultCard");
+
 const explanationDiv = document.getElementById("explanationCard");
 
 const loading = document.getElementById("loading");
+
 const loadingText = document.getElementById("loadingText");
 
 const predictBtn = document.getElementById("predictBtn");
+
 const explainBtn = document.getElementById("explainBtn");
+
+
+// ======================================================
+// INITIAL STATE
+// ======================================================
 
 initStates();
 
 
 // ======================================================
 // PREDICT
-// IMPORTANT:
-// /predict ONLY performs the ML prediction.
-// It does NOT request SHAP.
 // ======================================================
 
 form.addEventListener("submit", async (e) => {
@@ -39,22 +44,31 @@ form.addEventListener("submit", async (e) => {
 
         const data = collectFormData();
 
-        console.log("Sending prediction data:", data);
+        console.log(
+            "Sending prediction data:",
+            data
+        );
 
-        const res = await fetch(`${API_URL}/predict`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(data)
-        });
+        const res = await fetch(
+            `${API_URL}/predict`,
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify(data)
+            }
+        );
 
         console.log(
             "Prediction response status:",
             res.status
         );
 
-        const responseText = await res.text();
+        const responseText =
+            await res.text();
 
         console.log(
             "Prediction backend response:",
@@ -68,7 +82,8 @@ form.addEventListener("submit", async (e) => {
             );
         }
 
-        const result = JSON.parse(responseText);
+        const result =
+            JSON.parse(responseText);
 
         console.log(
             "Prediction result:",
@@ -93,9 +108,7 @@ form.addEventListener("submit", async (e) => {
     } finally {
 
         setLoading(false);
-
     }
-
 });
 
 
@@ -105,47 +118,61 @@ form.addEventListener("submit", async (e) => {
 
 function cleanReasons(reasons) {
 
-    if (!reasons || !Array.isArray(reasons)) {
+    if (
+        !reasons ||
+        !Array.isArray(reasons)
+    ) {
+
         return [];
     }
 
     return reasons.map((r) => {
 
-        let reason = String(r);
+        r = String(r);
 
         if (
-            reason.includes(
+            r.includes(
                 "Contract_Month-to-month"
             )
         ) {
-            return "Contract: Month-to-month (High churn risk)";
+
+            return (
+                "Contract: Month-to-month (High churn risk)"
+            );
         }
 
         if (
-            reason.includes(
+            r.includes(
                 "Contract_One year"
             )
         ) {
-            return "Contract: One year (Moderate stability)";
+
+            return (
+                "Contract: One year (Moderate stability)"
+            );
         }
 
         if (
-            reason.includes(
+            r.includes(
                 "Contract_Two year"
             )
         ) {
-            return "Contract: Two year (Low churn risk)";
+
+            return (
+                "Contract: Two year (Low churn risk)"
+            );
         }
 
-        return reason.replace(/_/g, " ");
-
+        return r.replace(
+            /_/g,
+            " "
+        );
     });
-
 }
 
 
 // ======================================================
-// SHOW PREDICTION RESULT
+// SHOW RESULT
 // ======================================================
 
 function showResult(data) {
@@ -183,14 +210,17 @@ function showResult(data) {
                 )
                 .join("")
 
-            : "<li>No specific reasons available</li>";
-
+            : `
+                <li class="muted">
+                    Click "Explain Prediction"
+                    to see the main churn factors.
+                </li>
+              `;
 
     const recommendation =
         data.recommended_action ||
         data.recommendation ||
         "No recommendation available";
-
 
     const riskLabel =
         data.risk_level ||
@@ -201,11 +231,13 @@ function showResult(data) {
 
         <div class="panel-header">
 
-            <h2>Churn Risk Result</h2>
+            <h2>
+                Churn Risk Result
+            </h2>
 
             <p>
-                Probability and retention insights
-                from the latest prediction.
+                Probability and retention
+                insights from the latest prediction.
             </p>
 
         </div>
@@ -347,16 +379,16 @@ function showResult(data) {
 
 
     // IMPORTANT:
-    // Prediction no longer contains SHAP explanation.
-    // Therefore we DO NOT call showExplanation() here.
-
+    //
+    // /predict no longer generates SHAP.
+    //
+    // Therefore do NOT automatically call
+    // showExplanation() here.
 }
 
 
 // ======================================================
 // EXPLAIN
-// IMPORTANT:
-// SHAP is ONLY generated here.
 // ======================================================
 
 explainBtn.onclick = async () => {
@@ -365,19 +397,29 @@ explainBtn.onclick = async () => {
         return;
     }
 
-
     setLoading(
         true,
-        "Generating prediction explanation...",
+        "Generating SHAP explanation...",
         explainBtn
     );
+
+
+    const controller =
+        new AbortController();
+
+    // Give SHAP enough time to finish.
+    // If Render/backend fails, we stop waiting.
+    const timeout =
+        setTimeout(
+            () => controller.abort(),
+            60000
+        );
 
 
     try {
 
         const data =
             collectFormData();
-
 
         console.log(
             "Sending explain request:",
@@ -397,7 +439,10 @@ explainBtn.onclick = async () => {
                     },
 
                     body:
-                        JSON.stringify(data)
+                        JSON.stringify(data),
+
+                    signal:
+                        controller.signal
                 }
             );
 
@@ -423,7 +468,6 @@ explainBtn.onclick = async () => {
             throw new Error(
                 `Explain failed with ${res.status}: ${responseText}`
             );
-
         }
 
 
@@ -452,24 +496,42 @@ explainBtn.onclick = async () => {
         );
 
 
-        showError(
-            explanationDiv,
-            "Explanation Failed",
-            err.message
-        );
+        if (
+            err.name ===
+            "AbortError"
+        ) {
+
+            showError(
+                explanationDiv,
+                "Explanation Timed Out",
+                "The SHAP explanation is taking too long. Please try again."
+            );
+
+        } else {
+
+            showError(
+                explanationDiv,
+                "Explanation Failed",
+                err.message
+            );
+        }
 
 
     } finally {
 
-        setLoading(false);
+        clearTimeout(
+            timeout
+        );
 
+        setLoading(
+            false
+        );
     }
-
 };
 
 
 // ======================================================
-// INITIAL STATE
+// INITIAL STATES
 // ======================================================
 
 function initStates() {
@@ -486,14 +548,13 @@ function initStates() {
             </h2>
 
             <p>
-                Run Explain Prediction to view
-                model reasoning.
+                Run Explain Prediction
+                to view model reasoning.
             </p>
 
         </div>
 
     `;
-
 }
 
 
@@ -518,7 +579,6 @@ function setLoading(
 
         loadingText.textContent =
             message;
-
     }
 
 
@@ -551,9 +611,7 @@ function setLoading(
         sourceButton.classList.add(
             "is-loading"
         );
-
     }
-
 }
 
 
@@ -587,14 +645,7 @@ function collectFormData() {
         );
 
 
-    data.SeniorCitizen =
-        Number(
-            data.SeniorCitizen
-        );
-
-
     return data;
-
 }
 
 
@@ -613,11 +664,12 @@ function normalizeProbability(
 
 
     if (
-        Number.isNaN(numeric)
+        Number.isNaN(
+            numeric
+        )
     ) {
 
         return 0;
-
     }
 
 
@@ -632,7 +684,6 @@ function normalizeProbability(
             ),
             1
         );
-
     }
 
 
@@ -643,7 +694,6 @@ function normalizeProbability(
         ),
         1
     );
-
 }
 
 
@@ -661,7 +711,8 @@ function getRiskInfo(
 
         return {
 
-            label: "Low",
+            label:
+                "Low",
 
             className:
                 "risk-low",
@@ -671,9 +722,7 @@ function getRiskInfo(
 
             caption:
                 "Customer is less likely to churn"
-
         };
-
     }
 
 
@@ -683,7 +732,8 @@ function getRiskInfo(
 
         return {
 
-            label: "Medium",
+            label:
+                "Medium",
 
             className:
                 "risk-medium",
@@ -693,15 +743,14 @@ function getRiskInfo(
 
             caption:
                 "Customer has moderate churn probability"
-
         };
-
     }
 
 
     return {
 
-        label: "High",
+        label:
+            "High",
 
         className:
             "risk-high",
@@ -711,9 +760,7 @@ function getRiskInfo(
 
         caption:
             "Customer is likely to churn"
-
     };
-
 }
 
 
@@ -731,7 +778,6 @@ function animateProbability(
             "riskRadial"
         );
 
-
     const label =
         document.getElementById(
             "riskPercentText"
@@ -744,7 +790,6 @@ function animateProbability(
     ) {
 
         return;
-
     }
 
 
@@ -806,16 +851,13 @@ function animateProbability(
                 requestAnimationFrame(
                     tick
                 );
-
             }
-
         };
 
 
     requestAnimationFrame(
         tick
     );
-
 }
 
 
@@ -836,7 +878,9 @@ function showExplanation(
         Array.isArray(
             explanation.positive_factors
         )
+
             ? explanation.positive_factors
+
             : [];
 
 
@@ -844,7 +888,29 @@ function showExplanation(
         Array.isArray(
             explanation.negative_factors
         )
+
             ? explanation.negative_factors
+
+            : [];
+
+
+    const neutralFactors =
+        Array.isArray(
+            explanation.neutral_factors
+        )
+
+            ? explanation.neutral_factors
+
+            : [];
+
+
+    const features =
+        Array.isArray(
+            explanation.features
+        )
+
+            ? explanation.features
+
             : [];
 
 
@@ -868,13 +934,17 @@ function showExplanation(
             </h2>
 
             <p>
-                ${escapeHTML(summary)}
+                ${escapeHTML(
+                    summary
+                )}
             </p>
 
         </div>
 
 
-        <div class="explanation-body result-shell">
+        <div
+            class="explanation-body result-shell"
+        >
 
 
             <div class="explain-block">
@@ -925,11 +995,26 @@ function showExplanation(
             <div class="explain-block">
 
                 <h4>
+                    Minimal Influence Factors
+                </h4>
+
+                ${renderFactorList(
+                    neutralFactors,
+                    "chip-neutral",
+                    "No neutral factors found"
+                )}
+
+            </div>
+
+
+            <div class="explain-block">
+
+                <h4>
                     SHAP Feature Contributions
                 </h4>
 
-                ${renderShapRows(
-                    explanation.features
+                ${renderFeatureRows(
+                    features
                 )}
 
             </div>
@@ -938,7 +1023,6 @@ function showExplanation(
         </div>
 
     `;
-
 }
 
 
@@ -953,18 +1037,18 @@ function renderFactorList(
 ) {
 
     if (
-        !items ||
         !items.length
     ) {
 
         return `
+
             <p class="muted">
                 ${escapeHTML(
                     fallbackText
                 )}
             </p>
-        `;
 
+        `;
     }
 
 
@@ -976,49 +1060,17 @@ function renderFactorList(
                 .map(
                     (item) => {
 
-                        // Backend returns objects.
-                        // Convert them into useful text.
+                        const feature =
+                            item.feature ||
+                            "Feature";
 
-                        if (
-                            typeof item ===
-                            "object" &&
-                            item !== null
-                        ) {
+                        const value =
+                            item.value ||
+                            "";
 
-                            const feature =
-                                item.feature ||
-                                "Feature";
-
-                            const value =
-                                item.value ||
-                                "Unknown";
-
-                            const impact =
-                                item.impact ||
-                                "";
-
-                            return `
-
-                                <span
-                                    class="chip ${className}"
-                                >
-                                    ${escapeHTML(
-                                        feature
-                                    )}
-                                    :
-                                    ${escapeHTML(
-                                        String(value)
-                                    )}
-                                    ${impact
-                                        ? `(${escapeHTML(
-                                            impact
-                                          )})`
-                                        : ""}
-                                </span>
-
-                            `;
-
-                        }
+                        const impact =
+                            item.impact ||
+                            "";
 
 
                         return `
@@ -1027,12 +1079,25 @@ function renderFactorList(
                                 class="chip ${className}"
                             >
                                 ${escapeHTML(
-                                    String(item)
+                                    feature
                                 )}
+
+                                ${value
+                                    ? `: ${escapeHTML(
+                                        String(value)
+                                    )}`
+                                    : ""
+                                }
+
+                                ${impact
+                                    ? ` (${escapeHTML(
+                                        String(impact)
+                                    )})`
+                                    : ""
+                                }
                             </span>
 
                         `;
-
                     }
                 )
                 .join("")}
@@ -1040,35 +1105,34 @@ function renderFactorList(
         </div>
 
     `;
-
 }
 
 
 // ======================================================
-// RENDER SHAP ROWS
+// RENDER SHAP FEATURE ROWS
 // ======================================================
 
-function renderShapRows(
+function renderFeatureRows(
     features
 ) {
 
     if (
-        !Array.isArray(features) ||
         !features.length
     ) {
 
         return `
-            <p class="muted">
-                No SHAP values returned.
-            </p>
-        `;
 
+            <p class="muted">
+                No SHAP feature values returned.
+            </p>
+
+        `;
     }
 
 
     const rows =
         features
-            .slice(0, 8)
+            .slice(0, 9)
             .map(
                 (entry) => {
 
@@ -1097,11 +1161,30 @@ function renderShapRows(
                         );
 
 
+                    const contribution =
+                        Number(
+                            entry.contribution_percentage_points ||
+                            0
+                        );
+
+
                     const formatted =
                         Number.isFinite(
                             shapValue
                         )
+
                             ? shapValue.toFixed(4)
+
+                            : "N/A";
+
+
+                    const contributionText =
+                        Number.isFinite(
+                            contribution
+                        )
+
+                            ? `${contribution.toFixed(2)} pp`
+
                             : "N/A";
 
 
@@ -1109,7 +1192,7 @@ function renderShapRows(
                         escapeHTML(
                             String(
                                 entry.impact ||
-                                ""
+                                "Unknown"
                             )
                         );
 
@@ -1132,13 +1215,16 @@ function renderShapRows(
                             </span>
 
                             <span>
+                                ${contributionText}
+                            </span>
+
+                            <span>
                                 ${impact}
                             </span>
 
                         </div>
 
                     `;
-
                 }
             )
             .join("");
@@ -1153,12 +1239,11 @@ function renderShapRows(
         </div>
 
     `;
-
 }
 
 
 // ======================================================
-// ERROR DISPLAY
+// SHOW ERROR
 // ======================================================
 
 function showError(
@@ -1172,12 +1257,14 @@ function showError(
         <div class="panel-header">
 
             <h2>
-                ${escapeHTML(title)}
+                ${escapeHTML(
+                    title
+                )}
             </h2>
 
             <p>
-                Please try again after checking
-                the backend status.
+                Please try again after
+                checking the backend status.
             </p>
 
         </div>
@@ -1195,12 +1282,11 @@ function showError(
         </div>
 
     `;
-
 }
 
 
 // ======================================================
-// HTML ESCAPE
+// ESCAPE HTML
 // ======================================================
 
 function escapeHTML(
@@ -1233,5 +1319,4 @@ function escapeHTML(
             /'/g,
             "&#39;"
         );
-
 }

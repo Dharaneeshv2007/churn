@@ -4,17 +4,18 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 
 from utils.preprocessing import preprocess_data, load_and_prepare_data
+
 from utils.shap_explainer import (
     SHAP_BACKGROUND_SIZE,
     ShapExplanationError,
     build_prediction_explanation,
 )
+
 from utils.recommendation import get_recommendation
 from utils.clv import calculate_clv
 
@@ -39,9 +40,13 @@ app = Flask(__name__)
 
 logger = logging.getLogger(__name__)
 
+logging.basicConfig(
+    level=logging.INFO
+)
+
 
 # ============================================================
-# CORS
+# CORS CONFIGURATION
 # ============================================================
 
 CORS(
@@ -99,6 +104,55 @@ ENCODER_PATH = os.path.join(
 
 
 # ============================================================
+# GLOBAL MODEL
+# ============================================================
+
+MODEL = None
+
+
+def load_saved_model():
+    """
+    Load the trained model once when the application starts.
+
+    This avoids loading the TensorFlow model for every request.
+    """
+
+    global MODEL
+
+    if not os.path.exists(MODEL_PATH):
+
+        logger.warning(
+            "Model file does not exist: %s",
+            MODEL_PATH
+        )
+
+        MODEL = None
+        return
+
+    try:
+
+        MODEL = load_model(
+            MODEL_PATH,
+            compile=False
+        )
+
+        logger.info(
+            "Trained model loaded successfully."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Failed to load trained model."
+        )
+
+        MODEL = None
+
+
+load_saved_model()
+
+
+# ============================================================
 # REFERENCE DATA
 # ============================================================
 
@@ -128,6 +182,7 @@ REFERENCE_STATS = {
 def _validate_customer(data, encoder):
 
     if not isinstance(data, dict) or not data:
+
         raise ValueError(
             "Request body must be a non-empty JSON object"
         )
@@ -149,6 +204,7 @@ def _validate_customer(data, encoder):
     )
 
     if missing:
+
         raise ValueError(
             f"Missing required fields: {', '.join(missing)}"
         )
@@ -165,7 +221,10 @@ def _validate_customer(data, encoder):
     ):
 
         try:
-            value = float(data[name])
+
+            value = float(
+                data[name]
+            )
 
         except (
             TypeError,
@@ -177,6 +236,7 @@ def _validate_customer(data, encoder):
             ) from None
 
         if not np.isfinite(value):
+
             raise ValueError(
                 f"{name} must be finite"
             )
@@ -205,10 +265,10 @@ def _validate_customer(data, encoder):
 
 
 # ============================================================
-# LOAD CUSTOMER CONTEXT
+# LOAD CUSTOMER INPUT
 # ============================================================
 
-def _load_customer_context(data):
+def _load_customer_input(data):
 
     scaler = joblib.load(
         SCALER_PATH
@@ -230,6 +290,30 @@ def _load_customer_context(data):
         encoder=encoder,
     )
 
+    return (
+        X,
+        feature_names,
+    )
+
+
+# ============================================================
+# LOAD CUSTOMER CONTEXT FOR SHAP
+# ============================================================
+
+def _load_customer_context(data):
+
+    X, feature_names = _load_customer_input(
+        data
+    )
+
+    scaler = joblib.load(
+        SCALER_PATH
+    )
+
+    encoder = joblib.load(
+        ENCODER_PATH
+    )
+
     reference_X, _, _, _, _ = preprocess_data(
         REFERENCE_DATA,
         fit=False,
@@ -237,9 +321,13 @@ def _load_customer_context(data):
         encoder=encoder,
     )
 
+    background_X = reference_X[
+        :SHAP_BACKGROUND_SIZE
+    ]
+
     return (
         X,
-        reference_X[:SHAP_BACKGROUND_SIZE],
+        background_X,
         feature_names,
     )
 
@@ -252,7 +340,10 @@ def _predict_probability(model, X):
 
     model_input = X
 
-    # LSTM / GRU models expect 3D input.
+    # --------------------------------------------------------
+    # LSTM / GRU models expect 3D input
+    # --------------------------------------------------------
+
     if (
         len(
             getattr(
@@ -309,6 +400,7 @@ def health():
         "model_exists": os.path.exists(
             MODEL_PATH
         ),
+        "model_loaded": MODEL is not None,
     })
 
 
@@ -321,6 +413,8 @@ def health():
     methods=["GET"]
 )
 def train():
+
+    global MODEL
 
     df = load_and_prepare_data(
         DATA_PATH
@@ -408,6 +502,15 @@ def train():
         ENCODER_PATH
     )
 
+    # --------------------------------------------------------
+    # Update global model
+    # --------------------------------------------------------
+
+    MODEL = load_model(
+        MODEL_PATH,
+        compile=False
+    )
+
     return jsonify({
         "status": "Model trained successfully",
         "metrics": best_metrics
@@ -416,12 +519,6 @@ def train():
 
 # ============================================================
 # PREDICT
-#
-# IMPORTANT:
-# /predict DOES NOT RUN SHAP.
-#
-# Prediction and explanation are intentionally separated.
-# This keeps prediction fast and prevents Gunicorn timeout.
 # ============================================================
 
 @app.route(
@@ -434,10 +531,11 @@ def train():
 def predict():
 
     # --------------------------------------------------------
-    # CORS preflight
+    # Handle browser CORS preflight request
     # --------------------------------------------------------
 
     if request.method == "OPTIONS":
+
         return "", 200
 
     try:
@@ -451,53 +549,52 @@ def predict():
         )
 
         if not isinstance(data, dict) or not data:
+
             return jsonify({
-                "error": "Request body must be a non-empty JSON object"
+                "error": (
+                    "Request body must be a "
+                    "non-empty JSON object"
+                )
             }), 400
 
         # ----------------------------------------------------
         # Check model
         # ----------------------------------------------------
 
-        if not os.path.exists(
-            MODEL_PATH
-        ):
+        if MODEL is None:
 
             return jsonify({
                 "error": (
-                    "Model not trained. "
-                    "Call /train first"
+                    "Model is not loaded. "
+                    "Please check the saved model."
                 )
-            }), 400
+            }), 500
 
         # ----------------------------------------------------
         # Prepare customer data
+        #
+        # IMPORTANT:
+        # No SHAP background is created here.
+        # This keeps /predict fast.
         # ----------------------------------------------------
 
-        X, _, _ = _load_customer_context(
+        X, _feature_names = _load_customer_input(
             data
         )
 
         # ----------------------------------------------------
-        # Load trained model
-        # ----------------------------------------------------
-
-        model = load_model(
-            MODEL_PATH
-        )
-
-        # ----------------------------------------------------
-        # Prediction ONLY
-        #
-        # NO SHAP HERE
+        # Predict churn probability
         # ----------------------------------------------------
 
         prob = _predict_probability(
-            model,
+            MODEL,
             X
         )
 
-        # Safety clamp
+        # ----------------------------------------------------
+        # Keep probability inside valid range
+        # ----------------------------------------------------
+
         prob = min(
             max(prob, 0.0),
             1.0
@@ -540,8 +637,14 @@ def predict():
         # ----------------------------------------------------
 
         clv = calculate_clv(
-            data.get("tenure", 0),
-            data.get("MonthlyCharges", 0)
+            data.get(
+                "tenure",
+                0
+            ),
+            data.get(
+                "MonthlyCharges",
+                0
+            )
         )
 
         # ----------------------------------------------------
@@ -553,9 +656,11 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # RETURN ONLY PREDICTION RESULT
+        # IMPORTANT
         #
-        # SHAP is deliberately NOT included.
+        # SHAP is NOT executed here.
+        #
+        # Explanation is generated only by /explain.
         # ----------------------------------------------------
 
         return jsonify({
@@ -578,6 +683,7 @@ def predict():
             "top_reasons": [],
 
             "prediction_explanation": None
+
         })
 
     except ValueError as error:
@@ -600,22 +706,9 @@ def predict():
             "error": str(error)
         }), 500
 
-    except Exception as error:
-
-        logger.exception(
-            "Unexpected prediction error"
-        )
-
-        return jsonify({
-            "error": str(error)
-        }), 500
-
 
 # ============================================================
 # EXPLAIN
-#
-# IMPORTANT:
-# /explain is the ONLY endpoint that runs SHAP.
 # ============================================================
 
 @app.route(
@@ -628,10 +721,11 @@ def predict():
 def explain():
 
     # --------------------------------------------------------
-    # CORS preflight
+    # Handle browser CORS preflight request
     # --------------------------------------------------------
 
     if request.method == "OPTIONS":
+
         return "", 200
 
     try:
@@ -645,24 +739,26 @@ def explain():
         )
 
         if not isinstance(data, dict) or not data:
+
             return jsonify({
-                "error": "Request body must be a non-empty JSON object"
+                "error": (
+                    "Request body must be a "
+                    "non-empty JSON object"
+                )
             }), 400
 
         # ----------------------------------------------------
         # Check model
         # ----------------------------------------------------
 
-        if not os.path.exists(
-            MODEL_PATH
-        ):
+        if MODEL is None:
 
             return jsonify({
-                "error": "Model not trained"
-            }), 400
+                "error": "Model is not loaded"
+            }), 500
 
         # ----------------------------------------------------
-        # Prepare customer data
+        # Prepare customer data + SHAP background
         # ----------------------------------------------------
 
         (
@@ -673,29 +769,27 @@ def explain():
             data
         )
 
-        # ----------------------------------------------------
-        # Load model
-        # ----------------------------------------------------
-
-        model = load_model(
-            MODEL_PATH
+        logger.info(
+            "Starting SHAP explanation..."
         )
 
         # ----------------------------------------------------
         # Generate SHAP explanation
-        #
-        # This is intentionally only here.
         # ----------------------------------------------------
 
         prediction_explanation = (
             build_prediction_explanation(
-                model,
+                MODEL,
                 X,
                 feature_names,
                 input_data=data,
                 reference_stats=REFERENCE_STATS,
                 background_X=background_X,
             )
+        )
+
+        logger.info(
+            "SHAP explanation completed."
         )
 
         return jsonify({
@@ -705,7 +799,10 @@ def explain():
             "prediction_explanation":
                 prediction_explanation,
 
+            # Keep these fields at the top level too
+            # for compatibility with your frontend.
             **prediction_explanation
+
         })
 
     except ValueError as error:
@@ -749,7 +846,8 @@ def explain():
         )
 
         return jsonify({
-            "error": str(error)
+            "error": "Unexpected error while generating explanation",
+            "details": str(error)
         }), 500
 
 
@@ -759,15 +857,13 @@ def explain():
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=int(
+            os.environ.get(
+                "PORT",
+                5000
+            )
+        ),
         debug=True
     )

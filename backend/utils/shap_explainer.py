@@ -1,391 +1,166 @@
 import logging
+from threading import Lock
 
 import numpy as np
 import shap
 
 from utils.preprocessing import CAT_COLS, NUM_COLS
 
-
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# SHAP PERFORMANCE SETTINGS
-# ============================================================
-
-# Reduced from 100 to 20.
-# This makes the explanation much faster on Render.
-
-SHAP_BACKGROUND_SIZE = 20
-
-
-# Reduced from 200 to 40.
-# Kernel SHAP becomes significantly faster.
-
-SHAP_NSAMPLES = 40
-
-
-# Features with very small SHAP values are treated as neutral.
-
+# Small deterministic background keeps explanations practical on Render.
+SHAP_BACKGROUND_SIZE = 12
+SHAP_NSAMPLES = 32
 NEUTRAL_THRESHOLD = 0.005
 
-
-# ============================================================
-# DISPLAY LABELS
-# ============================================================
-
 LABELS = {
-
-    "SeniorCitizen":
-        "Senior Citizen",
-
-    "MonthlyCharges":
-        "Monthly Charges",
-
-    "TotalCharges":
-        "Total Charges",
-
-    "InternetService":
-        "Internet Service",
-
-    "Partner":
-        "Partner",
-
-    "Dependents":
-        "Dependents",
-
-    "Contract":
-        "Contract",
-
-    "tenure":
-        "Tenure",
-
-    "gender":
-        "Gender",
+    "SeniorCitizen": "Senior Citizen",
+    "MonthlyCharges": "Monthly Charges",
+    "TotalCharges": "Total Charges",
+    "InternetService": "Internet Service",
+    "Partner": "Partner",
+    "Dependents": "Dependents",
+    "Contract": "Contract",
+    "tenure": "Tenure",
+    "gender": "Gender",
 }
 
 
-# ============================================================
-# CUSTOM ERROR
-# ============================================================
-
 class ShapExplanationError(RuntimeError):
-    """
-    Raised when a real SHAP explanation
-    cannot be generated.
-    """
-
     pass
 
 
-# ============================================================
-# MODEL INPUT
-# ============================================================
+_EXPLAINER = None
+_EXPLAINER_MODEL_ID = None
+_EXPLAINER_BACKGROUND = None
+_EXPLAINER_LOCK = Lock()
+
 
 def _model_input(data, model):
-
-    values = np.asarray(
-        data,
-        dtype=np.float32
-    )
-
-    input_shape = getattr(
-        model,
-        "input_shape",
-        None
-    )
-
-    # LSTM / GRU expects:
-    #
-    # samples
-    # features
-    # channels
-    #
-    # Instead of:
-    #
-    # samples
-    # features
-
-    if (
-        input_shape
-        and len(input_shape) == 3
-        and values.ndim == 2
-    ):
-
-        return values.reshape(
-            values.shape[0],
-            values.shape[1],
-            1
-        )
-
+    values = np.asarray(data, dtype=np.float32)
+    input_shape = getattr(model, "input_shape", None)
+    if input_shape and len(input_shape) == 3 and values.ndim == 2:
+        return values.reshape(values.shape[0], values.shape[1], 1)
     return values
 
 
-# ============================================================
-# SHAP PREDICTION FUNCTION
-# ============================================================
-
 def _prediction_function(model):
-
     def predict_fn(data):
-
-        model_input = _model_input(
-            data,
-            model
-        )
-
         predictions = np.asarray(
-            model.predict(
-                model_input,
-                verbose=0
-            )
+            model.predict(_model_input(data, model), verbose=0)
         )
-
         return predictions.reshape(-1)
-
     return predict_fn
 
 
-# ============================================================
-# GET ONE SHAP ROW
-# ============================================================
-
 def _one_row(values):
-
-    values = np.asarray(
-        values,
-        dtype=float
-    )
-
+    values = np.asarray(values, dtype=float)
     if values.ndim == 0:
-
-        return np.asarray([
-            float(values)
-        ])
-
+        return np.asarray([float(values)])
     if values.ndim == 1:
-
         return values
-
     return values[0].reshape(-1)
 
 
-# ============================================================
-# GROUP TRANSFORMED FEATURES
-# ============================================================
-
 def _raw_feature_groups(feature_names):
-
-    groups = {
-        name: []
-        for name in NUM_COLS + CAT_COLS
-    }
-
-    for index, encoded_name in enumerate(
-        feature_names
-    ):
-
-        # Numerical feature
-
+    groups = {name: [] for name in NUM_COLS + CAT_COLS}
+    for index, encoded_name in enumerate(feature_names):
         if encoded_name in NUM_COLS:
-
-            groups[
-                encoded_name
-            ].append(index)
-
+            groups[encoded_name].append(index)
             continue
-
-        # One-hot encoded categorical feature
-
+        matched = False
         for category_name in CAT_COLS:
-
-            if encoded_name.startswith(
-                f"{category_name}_"
-            ):
-
-                groups[
-                    category_name
-                ].append(index)
-
+            if encoded_name.startswith(f"{category_name}_"):
+                groups[category_name].append(index)
+                matched = True
                 break
-
-        else:
-
+        if not matched:
             raise ShapExplanationError(
-                (
-                    "Unable to map transformed "
-                    f"feature '{encoded_name}' "
-                    "to an input feature"
-                )
+                f"Unable to map transformed feature '{encoded_name}'"
             )
-
     return groups
 
 
-# ============================================================
-# NORMALIZE VALUES
-# ============================================================
-
 def _normalize_value(value):
-
     if value is None:
-
         return "Unknown"
-
-    if isinstance(
-        value,
-        (
-            np.integer,
-            int
-        )
-    ):
-
+    if isinstance(value, (np.integer, int)):
         return int(value)
-
-    if isinstance(
-        value,
-        (
-            np.floating,
-            float
-        )
-    ):
-
+    if isinstance(value, (np.floating, float)):
         if not np.isfinite(value):
-
             return "Unknown"
-
         if float(value).is_integer():
-
             return int(value)
-
-        return round(
-            float(value),
-            2
-        )
-
+        return round(float(value), 2)
     return value
 
 
-# ============================================================
-# FORMAT CUSTOMER VALUE
-# ============================================================
-
-def _format_value(
-    feature_name,
-    value
-):
-
-    value = _normalize_value(
-        value
-    )
-
+def _format_value(feature_name, value):
+    value = _normalize_value(value)
     if feature_name == "SeniorCitizen":
-
-        return (
-            "Yes"
-            if str(value).strip().lower()
-            in {
-                "1",
-                "yes",
-                "true"
-            }
-            else
-            "No"
-        )
-
+        return "Yes" if str(value).strip().lower() in {"1", "yes", "true"} else "No"
     if feature_name == "tenure":
-
         return f"{value} months"
-
-    if feature_name in {
-        "MonthlyCharges",
-        "TotalCharges"
-    }:
-
+    if feature_name in {"MonthlyCharges", "TotalCharges"}:
         try:
-
-            return (
-                f"${float(value):,.2f}"
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
+            return f"${float(value):,.2f}"
+        except (TypeError, ValueError):
             return "Unknown"
-
     return value
 
-
-# ============================================================
-# SHAP IMPACT
-# ============================================================
 
 def _impact(shap_value):
-
-    if (
-        abs(shap_value)
-        <= NEUTRAL_THRESHOLD
-    ):
-
+    if abs(shap_value) <= NEUTRAL_THRESHOLD:
         return "Minimal influence"
-
-    if shap_value > 0:
-
-        return "Increased churn risk"
-
-    return "Reduced churn risk"
+    return "Increased churn risk" if shap_value > 0 else "Reduced churn risk"
 
 
-# ============================================================
-# FEATURE REASON
-# ============================================================
-
-def _feature_reason(
-    feature_name,
-    value,
-    impact
-):
-
+def _feature_reason(feature_name, value, impact):
     direction = {
-
-        "Increased churn risk":
-            "higher churn risk",
-
-        "Reduced churn risk":
-            "lower churn risk",
-
-        "Minimal influence":
-            "minimal influence on churn risk",
-
+        "Increased churn risk": "higher churn risk",
+        "Reduced churn risk": "lower churn risk",
+        "Minimal influence": "minimal influence on churn risk",
     }[impact]
-
     return (
-        f"The customer's "
-        f"{LABELS[feature_name]} "
-        f"value ({value}) is pushing "
-        f"the prediction toward "
-        f"{direction}."
+        f"The customer's {LABELS[feature_name]} value ({value}) "
+        f"is pushing the prediction toward {direction}."
     )
 
-
-# ============================================================
-# SAFE FLOAT
-# ============================================================
 
 def _as_float(value):
-
-    return float(
-        np.asarray(
-            value
-        ).reshape(-1)[0]
-    )
+    return float(np.asarray(value).reshape(-1)[0])
 
 
-# ============================================================
-# BUILD SHAP EXPLANATION
-# ============================================================
+def _get_gradient_explainer(model, background):
+    global _EXPLAINER, _EXPLAINER_MODEL_ID, _EXPLAINER_BACKGROUND
+
+    model_id = id(model)
+    background = np.asarray(background, dtype=np.float32)
+
+    with _EXPLAINER_LOCK:
+        if (
+            _EXPLAINER is None
+            or _EXPLAINER_MODEL_ID != model_id
+            or _EXPLAINER_BACKGROUND is None
+            or _EXPLAINER_BACKGROUND.shape != background.shape
+        ):
+            try:
+                # GradientExplainer is substantially cheaper than KernelExplainer
+                # for this differentiable Keras LSTM/GRU model.
+                _EXPLAINER = shap.GradientExplainer(
+                    model,
+                    _model_input(background, model),
+                )
+                _EXPLAINER_MODEL_ID = model_id
+                _EXPLAINER_BACKGROUND = background.copy()
+                logger.info("Created cached SHAP GradientExplainer")
+            except Exception as error:
+                _EXPLAINER = None
+                raise ShapExplanationError(
+                    f"Could not initialize SHAP explainer: {error}"
+                ) from error
+        return _EXPLAINER
+
 
 def build_prediction_explanation(
     model,
@@ -395,467 +170,120 @@ def build_prediction_explanation(
     reference_stats=None,
     background_X=None,
 ):
-
-    # reference_stats is retained for API compatibility.
     del reference_stats
 
     try:
+        values = np.asarray(X, dtype=np.float32)
+        background = np.asarray(background_X, dtype=np.float32)
 
-        # ----------------------------------------------------
-        # Convert arrays
-        # ----------------------------------------------------
+        if values.ndim != 2 or values.shape[0] != 1:
+            raise ShapExplanationError("SHAP expects exactly one transformed customer row")
+        if background.ndim != 2 or background.shape[1] != values.shape[1]:
+            raise ShapExplanationError("SHAP background does not match model feature dimensions")
 
-        values = np.asarray(
-            X,
-            dtype=np.float32
+        groups = _raw_feature_groups(feature_names)
+        explainer = _get_gradient_explainer(model, background)
+
+        # Gradient SHAP works directly with the 3-D model input.
+        raw = explainer.shap_values(
+            _model_input(values, model),
+            nsamples=SHAP_NSAMPLES,
         )
+        shap_row = _one_row(raw)
 
-        background = np.asarray(
-            background_X,
-            dtype=np.float32
-        )
+        # Some SHAP versions return an extra output dimension.
+        if shap_row.size != len(feature_names):
+            arr = np.asarray(raw, dtype=float)
+            while arr.ndim > 3 and arr.shape[-1] == 1:
+                arr = np.squeeze(arr, axis=-1)
+            if arr.ndim >= 2:
+                shap_row = arr.reshape(arr.shape[0], -1)[0]
+            else:
+                shap_row = arr.reshape(-1)
 
-        # ----------------------------------------------------
-        # Validate customer row
-        # ----------------------------------------------------
-
-        if (
-            values.ndim != 2
-            or values.shape[0] != 1
-        ):
-
+        if shap_row.size != len(feature_names):
             raise ShapExplanationError(
-                (
-                    "SHAP expects exactly "
-                    "one transformed customer row"
-                )
+                f"SHAP returned {shap_row.size} values for {len(feature_names)} features"
             )
-
-        # ----------------------------------------------------
-        # Validate background
-        # ----------------------------------------------------
-
-        if (
-            background.ndim != 2
-            or background.shape[1]
-            != values.shape[1]
-        ):
-
-            raise ShapExplanationError(
-                (
-                    "SHAP background does not "
-                    "match model feature dimensions"
-                )
-            )
-
-        # ----------------------------------------------------
-        # Group features
-        # ----------------------------------------------------
-
-        groups = _raw_feature_groups(
-            feature_names
-        )
-
-        # ----------------------------------------------------
-        # Prediction function
-        # ----------------------------------------------------
-
-        predict_fn = _prediction_function(
-            model
-        )
-
-        # ----------------------------------------------------
-        # Kernel SHAP
-        #
-        # IMPORTANT:
-        # Background and nsamples are deliberately
-        # small for Render performance.
-        # ----------------------------------------------------
-
-        explainer = shap.KernelExplainer(
-            predict_fn,
-            background
-        )
-
-        raw_shap_values = (
-            explainer.shap_values(
-                values,
-                nsamples=SHAP_NSAMPLES
-            )
-        )
-
-        # ----------------------------------------------------
-        # Convert SHAP result to one row
-        # ----------------------------------------------------
-
-        shap_row = _one_row(
-            raw_shap_values
-        )
-
-        # ----------------------------------------------------
-        # Validate SHAP dimensions
-        # ----------------------------------------------------
-
-        if (
-            shap_row.size
-            != len(feature_names)
-        ):
-
-            raise ShapExplanationError(
-                (
-                    "SHAP returned an "
-                    "unexpected feature dimension"
-                )
-            )
-
-        # ----------------------------------------------------
-        # Base value
-        # ----------------------------------------------------
-
-        base_value = _as_float(
-            explainer.expected_value
-        )
-
-        # ----------------------------------------------------
-        # Actual prediction
-        # ----------------------------------------------------
 
         prediction_probability = _as_float(
-            predict_fn(values)
+            _prediction_function(model)(values)
         )
 
-        # ----------------------------------------------------
-        # Group SHAP values
-        #
-        # Example:
-        #
-        # Contract_Month-to-month
-        # Contract_One year
-        # Contract_Two year
-        #
-        # become:
-        #
-        # Contract
-        # ----------------------------------------------------
-
+        # GradientExplainer does not expose a scalar expected_value consistently
+        # across SHAP versions. We therefore report the actual model probability
+        # and feature contributions, which are the useful parts for the UI.
         grouped_values = {
-
-            feature: float(
-                np.sum(
-                    shap_row[indexes]
-                )
-            )
-
-            for feature, indexes
-            in groups.items()
+            feature: float(np.sum(shap_row[indexes]))
+            for feature, indexes in groups.items()
         }
 
-        # ----------------------------------------------------
-        # SHAP reconstruction
-        # ----------------------------------------------------
-
-        reconstructed = (
-            base_value
-            + sum(
-                grouped_values.values()
-            )
-        )
-
-        additivity_error = abs(
-            reconstructed
-            - prediction_probability
-        )
-
-        if additivity_error > 0.05:
-
-            logger.warning(
-                (
-                    "SHAP additivity check "
-                    "exceeded tolerance: "
-                    "error=%f "
-                    "prediction=%f "
-                    "reconstructed=%f"
-                ),
-                additivity_error,
-                prediction_probability,
-                reconstructed,
-            )
-
-        # ----------------------------------------------------
-        # Build feature explanations
-        # ----------------------------------------------------
-
         features = []
-
-        for (
-            feature_name,
-            shap_value
-        ) in grouped_values.items():
-
+        for feature_name, shap_value in grouped_values.items():
             formatted_value = _format_value(
                 feature_name,
-                (
-                    input_data or {}
-                ).get(
-                    feature_name,
-                    "Unknown"
-                )
+                (input_data or {}).get(feature_name, "Unknown"),
             )
-
-            impact = _impact(
-                shap_value
-            )
-
+            impact = _impact(shap_value)
             features.append({
-
-                "feature":
-                    LABELS[feature_name],
-
-                "value":
-                    formatted_value,
-
-                "shap_value":
-                    round(
-                        shap_value,
-                        6
-                    ),
-
-                "contribution_percentage_points":
-                    round(
-                        shap_value * 100,
-                        4
-                    ),
-
-                "importance":
-                    round(
-                        abs(shap_value),
-                        6
-                    ),
-
-                "impact":
-                    impact,
-
-                "reason":
-                    _feature_reason(
-                        feature_name,
-                        formatted_value,
-                        impact
-                    ),
+                "feature": LABELS[feature_name],
+                "value": formatted_value,
+                "shap_value": round(shap_value, 6),
+                "contribution_percentage_points": round(shap_value * 100, 4),
+                "importance": round(abs(shap_value), 6),
+                "impact": impact,
+                "reason": _feature_reason(feature_name, formatted_value, impact),
             })
 
-        # ----------------------------------------------------
-        # Sort by importance
-        # ----------------------------------------------------
+        features.sort(key=lambda item: item["importance"], reverse=True)
 
-        features.sort(
-            key=lambda item:
-                item["importance"],
-            reverse=True
-        )
+        risk_drivers = [x for x in features if x["shap_value"] > NEUTRAL_THRESHOLD]
+        protective_factors = [x for x in features if x["shap_value"] < -NEUTRAL_THRESHOLD]
+        neutral_factors = [x for x in features if abs(x["shap_value"]) <= NEUTRAL_THRESHOLD]
 
-        # ----------------------------------------------------
-        # Risk drivers
-        # ----------------------------------------------------
-
-        risk_drivers = [
-
-            item
-            for item in features
-
-            if (
-                item["shap_value"]
-                > NEUTRAL_THRESHOLD
-            )
-        ]
-
-        # ----------------------------------------------------
-        # Protective factors
-        # ----------------------------------------------------
-
-        protective_factors = [
-
-            item
-            for item in features
-
-            if (
-                item["shap_value"]
-                < -NEUTRAL_THRESHOLD
-            )
-        ]
-
-        # ----------------------------------------------------
-        # Neutral factors
-        # ----------------------------------------------------
-
-        neutral_factors = [
-
-            item
-            for item in features
-
-            if (
-                abs(
-                    item["shap_value"]
-                )
-                <= NEUTRAL_THRESHOLD
-            )
-        ]
-
-        # ----------------------------------------------------
-        # Top feature names
-        # ----------------------------------------------------
-
-        top_names = [
-
-            item["feature"]
-            for item in features[:3]
-        ]
-
+        top_names = [x["feature"] for x in features[:3]]
         if not top_names:
-
-            summary = (
-                "No major prediction factors "
-                "were identified."
-            )
-
+            summary = "No major prediction factors were identified."
         elif len(top_names) == 1:
-
-            summary = (
-                "The prediction is mainly "
-                f"driven by {top_names[0]}."
-            )
-
+            summary = f"The prediction is mainly driven by {top_names[0]}."
         elif len(top_names) == 2:
-
-            summary = (
-                "The prediction is mainly "
-                f"driven by {top_names[0]} "
-                f"and {top_names[1]}."
-            )
-
+            summary = f"The prediction is mainly driven by {top_names[0]} and {top_names[1]}."
         else:
-
             summary = (
-                "The prediction is mainly "
-                f"driven by {top_names[0]}, "
-                f"{top_names[1]}, and "
-                f"{top_names[2]}."
+                f"The prediction is mainly driven by {top_names[0]}, "
+                f"{top_names[1]}, and {top_names[2]}."
             )
-
-        # ----------------------------------------------------
-        # Return complete explanation
-        # ----------------------------------------------------
 
         return {
-
-            "base_value":
-                round(
-                    base_value,
-                    6
-                ),
-
-            "prediction_probability":
-                round(
-                    prediction_probability,
-                    6
-                ),
-
-            "reconstructed_probability":
-                round(
-                    reconstructed,
-                    6
-                ),
-
-            "additivity_error":
-                round(
-                    additivity_error,
-                    6
-                ),
-
-            "features":
-                features,
-
-            "risk_drivers":
-                risk_drivers,
-
-            "protective_factors":
-                protective_factors,
-
-            "neutral_factors":
-                neutral_factors,
-
-            "summary":
-                summary,
-
-            "positive_factors":
-                risk_drivers,
-
-            "negative_factors":
-                protective_factors,
-
-            "final_reason":
-                summary,
-
+            "method": "SHAP GradientExplainer",
+            "prediction_probability": round(prediction_probability, 6),
+            "features": features,
+            "risk_drivers": risk_drivers,
+            "protective_factors": protective_factors,
+            "neutral_factors": neutral_factors,
+            "summary": summary,
+            "positive_factors": risk_drivers,
+            "negative_factors": protective_factors,
+            "final_reason": summary,
             "top_reasons": [
-
-                (
-                    f"{item['feature']}: "
-                    f"{item['value']} "
-                    f"({item['impact']})"
-                )
-
-                for item
-                in features[:3]
+                f"{item['feature']}: {item['value']} ({item['impact']})"
+                for item in features[:3]
             ],
         }
 
     except ShapExplanationError:
-
         raise
-
     except Exception as error:
-
-        logger.exception(
-            "SHAP explanation failed"
-        )
-
+        logger.exception("SHAP explanation failed")
         raise ShapExplanationError(
             "Unable to generate SHAP explanation"
         ) from error
 
 
-# ============================================================
-# GET SHAP VALUES
-# ============================================================
-
-def get_shap_values(
-    model,
-    X,
-    feature_names,
-    return_full=False,
-    background_X=None
-):
-
-    explanation = (
-        build_prediction_explanation(
-            model,
-            X,
-            feature_names,
-            background_X=background_X
-        )
+def get_shap_values(model, X, feature_names, return_full=False, background_X=None):
+    explanation = build_prediction_explanation(
+        model, X, feature_names, background_X=background_X
     )
-
     if return_full:
-
-        return {
-            item["feature"]:
-                item["importance"]
-
-            for item
-            in explanation["features"]
-        }
-
-    return [
-        item["feature"]
-        for item
-        in explanation["features"][:3]
-    ]
+        return {x["feature"]: x["importance"] for x in explanation["features"]}
+    return [x["feature"] for x in explanation["features"][:3]]

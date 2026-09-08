@@ -1,5 +1,79 @@
 const API_URL = "https://churn-dki6.onrender.com";
 
+// ======================================================
+// API REQUEST HELPER
+// ======================================================
+// Handles Render cold starts, timeouts and non-JSON errors
+// without turning a backend failure into a confusing CORS message.
+async function apiRequest(path, payload = null, timeoutMs = 90000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const options = {
+            method: payload === null ? "GET" : "POST",
+            headers: {
+                "Accept": "application/json"
+            },
+            signal: controller.signal
+        };
+
+        if (payload !== null) {
+            options.headers["Content-Type"] = "application/json";
+            options.body = JSON.stringify(payload);
+        }
+
+        const response = await fetch(`${API_URL}${path}`, options);
+        const text = await response.text();
+
+        let body = null;
+        try {
+            body = text ? JSON.parse(text) : null;
+        } catch {
+            body = null;
+        }
+
+        if (!response.ok) {
+            const message =
+                (body && body.error) ||
+                `Backend returned HTTP ${response.status}`;
+            const error = new Error(message);
+            error.status = response.status;
+            throw error;
+        }
+
+        return body;
+    } catch (error) {
+        if (error.name === "AbortError") {
+            throw new Error(
+                "The backend is taking too long. Render may be waking up; please try again."
+            );
+        }
+        if (error instanceof TypeError) {
+            throw new Error(
+                "Could not reach the prediction server. Please check that the Render service is running."
+            );
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// Wake the Render service when the page opens.
+// This removes most of the cold-start delay from the first prediction.
+async function warmBackend() {
+    try {
+        await apiRequest("/health", null, 90000);
+        console.log("Backend is ready.");
+    } catch (error) {
+        console.warn("Backend warm-up:", error.message);
+    }
+}
+
+warmBackend();
+
+
 const form = document.getElementById("churnForm");
 
 const resultDiv = document.getElementById("resultCard");
@@ -49,41 +123,11 @@ form.addEventListener("submit", async (e) => {
             data
         );
 
-        const res = await fetch(
-            `${API_URL}/predict`,
-            {
-                method: "POST",
-
-                headers: {
-                    "Content-Type": "application/json"
-                },
-
-                body: JSON.stringify(data)
-            }
+        const result = await apiRequest(
+            "/predict",
+            data,
+            90000
         );
-
-        console.log(
-            "Prediction response status:",
-            res.status
-        );
-
-        const responseText =
-            await res.text();
-
-        console.log(
-            "Prediction backend response:",
-            responseText
-        );
-
-        if (!res.ok) {
-
-            throw new Error(
-                `Backend returned ${res.status}: ${responseText}`
-            );
-        }
-
-        const result =
-            JSON.parse(responseText);
 
         console.log(
             "Prediction result:",
@@ -404,18 +448,6 @@ explainBtn.onclick = async () => {
     );
 
 
-    const controller =
-        new AbortController();
-
-    // Give SHAP enough time to finish.
-    // If Render/backend fails, we stop waiting.
-    const timeout =
-        setTimeout(
-            () => controller.abort(),
-            60000
-        );
-
-
     try {
 
         const data =
@@ -427,54 +459,11 @@ explainBtn.onclick = async () => {
         );
 
 
-        const res =
-            await fetch(
-                `${API_URL}/explain`,
-                {
-                    method: "POST",
-
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
-
-                    body:
-                        JSON.stringify(data),
-
-                    signal:
-                        controller.signal
-                }
-            );
-
-
-        console.log(
-            "Explain response status:",
-            res.status
+        const result = await apiRequest(
+            "/explain",
+            data,
+            90000
         );
-
-
-        const responseText =
-            await res.text();
-
-
-        console.log(
-            "Explain backend response:",
-            responseText
-        );
-
-
-        if (!res.ok) {
-
-            throw new Error(
-                `Explain failed with ${res.status}: ${responseText}`
-            );
-        }
-
-
-        const result =
-            JSON.parse(
-                responseText
-            );
 
 
         console.log(
@@ -496,25 +485,11 @@ explainBtn.onclick = async () => {
         );
 
 
-        if (
-            err.name ===
-            "AbortError"
-        ) {
-
-            showError(
-                explanationDiv,
-                "Explanation Timed Out",
-                "The SHAP explanation is taking too long. Please try again."
-            );
-
-        } else {
-
-            showError(
-                explanationDiv,
-                "Explanation Failed",
-                err.message
-            );
-        }
+        showError(
+            explanationDiv,
+            "Explanation Failed",
+            err.message
+        );
 
 
     } finally {
@@ -706,7 +681,7 @@ function getRiskInfo(
 ) {
 
     if (
-        percent <= 30
+        percent < 40
     ) {
 
         return {
@@ -727,7 +702,7 @@ function getRiskInfo(
 
 
     if (
-        percent <= 60
+        percent < 75
     ) {
 
         return {

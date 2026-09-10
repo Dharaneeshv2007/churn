@@ -1,92 +1,204 @@
 const API_URL = "https://churn-dki6.onrender.com";
 
 // ======================================================
+// API CONFIGURATION
+// ======================================================
+
+const API_TIMEOUT = 120000;
+
+
+// ======================================================
 // API REQUEST HELPER
 // ======================================================
-// Handles Render cold starts, timeouts and non-JSON errors
-// without turning a backend failure into a confusing CORS message.
-async function apiRequest(path, payload = null, timeoutMs = 90000) {
+
+async function apiRequest(path, payload = null, timeoutMs = API_TIMEOUT) {
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const timer = setTimeout(() => {
+        controller.abort();
+    }, timeoutMs);
+
+    const startedAt = performance.now();
 
     try {
+
         const options = {
             method: payload === null ? "GET" : "POST",
+
             headers: {
                 "Accept": "application/json"
             },
+
             signal: controller.signal
         };
 
+        // Add JSON body for POST requests
         if (payload !== null) {
+
             options.headers["Content-Type"] = "application/json";
+
             options.body = JSON.stringify(payload);
         }
 
-        const response = await fetch(`${API_URL}${path}`, options);
+        console.log(
+            `[API] ${options.method} ${path} started`
+        );
+
+        const response = await fetch(
+            `${API_URL}${path}`,
+            options
+        );
+
+        const elapsed = Math.round(
+            performance.now() - startedAt
+        );
+
+        console.log(
+            `[API] ${options.method} ${path} response: ${response.status} (${elapsed} ms)`
+        );
+
         const text = await response.text();
 
         let body = null;
+
         try {
+
             body = text ? JSON.parse(text) : null;
+
         } catch {
+
             body = null;
         }
 
+        // Handle HTTP errors
         if (!response.ok) {
+
             const message =
-                (body && body.error) ||
+                (body && (body.error || body.message)) ||
                 `Backend returned HTTP ${response.status}`;
+
             const error = new Error(message);
+
             error.status = response.status;
+            error.responseBody = body;
+
             throw error;
         }
 
         return body;
+
     } catch (error) {
+
+        // Request timeout
         if (error.name === "AbortError") {
-            throw new Error(
-                "The backend is taking too long. Render may be waking up; please try again."
+
+            const timeoutError = new Error(
+                `${path} timed out after ${Math.round(timeoutMs / 1000)} seconds.`
             );
+
+            timeoutError.code = "TIMEOUT";
+
+            throw timeoutError;
         }
+
+        // Network error
         if (error instanceof TypeError) {
-            throw new Error(
-                "Could not reach the prediction server. Please check that the Render service is running."
+
+            const networkError = new Error(
+                `Could not reach ${API_URL}${path}. Check the Render backend and network connection.`
             );
+
+            networkError.code = "NETWORK_ERROR";
+
+            throw networkError;
         }
+
         throw error;
+
     } finally {
+
         clearTimeout(timer);
     }
 }
 
-// Wake the Render service when the page opens.
-// This removes most of the cold-start delay from the first prediction.
-async function warmBackend() {
-    try {
-        await apiRequest("/health", null, 90000);
-        console.log("Backend is ready.");
-    } catch (error) {
-        console.warn("Backend warm-up:", error.message);
+
+// ======================================================
+// BACKEND WARM-UP
+// ======================================================
+
+let backendReadyPromise = null;
+
+function warmBackend() {
+
+    // Avoid sending multiple health requests at the same time
+    if (backendReadyPromise) {
+        return backendReadyPromise;
     }
+
+    backendReadyPromise = (async () => {
+
+        try {
+
+            console.log(
+                "[Backend] Checking backend health..."
+            );
+
+            const result = await apiRequest(
+                "/health",
+                null,
+                API_TIMEOUT
+            );
+
+            console.log(
+                "[Backend] Backend is ready:",
+                result
+            );
+
+            return true;
+
+        } catch (error) {
+
+            console.warn(
+                "[Backend] Health check failed:",
+                error.message
+            );
+
+            return false;
+        }
+
+    })();
+
+    return backendReadyPromise;
 }
 
+
+// Start backend warm-up when page loads
 warmBackend();
 
+
+// ======================================================
+// DOM ELEMENTS
+// ======================================================
 
 const form = document.getElementById("churnForm");
 
 const resultDiv = document.getElementById("resultCard");
 
-const explanationDiv = document.getElementById("explanationCard");
+const explanationDiv =
+    document.getElementById("explanationCard");
 
-const loading = document.getElementById("loading");
+const loading =
+    document.getElementById("loading");
 
-const loadingText = document.getElementById("loadingText");
+const loadingText =
+    document.getElementById("loadingText");
 
-const predictBtn = document.getElementById("predictBtn");
+const predictBtn =
+    document.getElementById("predictBtn");
 
-const explainBtn = document.getElementById("explainBtn");
+const explainBtn =
+    document.getElementById("explainBtn");
 
 
 // ======================================================
@@ -110,43 +222,93 @@ form.addEventListener("submit", async (e) => {
 
     setLoading(
         true,
-        "Analyzing customer data...",
+        "Connecting to prediction server...",
         predictBtn
     );
 
     try {
 
+        // --------------------------------------------------
+        // STEP 1
+        // Check that Render is awake
+        // --------------------------------------------------
+
+        await warmBackend();
+
+        setLoading(
+            true,
+            "Analyzing customer data...",
+            predictBtn
+        );
+
+        // --------------------------------------------------
+        // STEP 2
+        // Collect form data
+        // --------------------------------------------------
+
         const data = collectFormData();
 
         console.log(
-            "Sending prediction data:",
+            "[Predict] Sending prediction data:",
             data
         );
+
+        // --------------------------------------------------
+        // STEP 3
+        // Send prediction request
+        // --------------------------------------------------
 
         const result = await apiRequest(
             "/predict",
             data,
-            90000
+            API_TIMEOUT
         );
 
         console.log(
-            "Prediction result:",
+            "[Predict] Prediction result:",
             result
         );
+
+        // --------------------------------------------------
+        // STEP 4
+        // Display result
+        // --------------------------------------------------
 
         showResult(result);
 
     } catch (err) {
 
         console.error(
-            "Prediction error:",
+            "[Predict] Prediction error:",
             err
         );
+
+        let message =
+            err.message ||
+            "Unexpected prediction error.";
+
+        if (err.code === "TIMEOUT") {
+
+            message =
+                "The prediction request timed out. " +
+                "The Render server is reachable, but /predict did not finish within 120 seconds.";
+
+        } else if (err.code === "NETWORK_ERROR") {
+
+            message =
+                "The browser could not reach the Render backend. " +
+                "Please check that the Render service is running.";
+
+        } else if (err.status) {
+
+            message =
+                `Backend error (HTTP ${err.status}): ${message}`;
+        }
 
         showError(
             resultDiv,
             "Prediction Failed",
-            `${err.message}. Please verify that the backend service is reachable.`
+            message
         );
 
     } finally {
@@ -270,7 +432,6 @@ function showResult(data) {
         data.risk_level ||
         levelInfo.label;
 
-
     resultDiv.innerHTML = `
 
         <div class="panel-header">
@@ -286,12 +447,9 @@ function showResult(data) {
 
         </div>
 
-
         <div class="result-shell">
 
-
             <div class="risk-meter">
-
 
                 <div class="radial-wrap">
 
@@ -314,7 +472,6 @@ function showResult(data) {
                     </div>
 
                 </div>
-
 
                 <div>
 
@@ -343,9 +500,7 @@ function showResult(data) {
 
             </div>
 
-
             <div class="result-meta">
-
 
                 <div class="meta-item">
 
@@ -361,7 +516,6 @@ function showResult(data) {
                     </p>
 
                 </div>
-
 
                 <div class="meta-item">
 
@@ -380,7 +534,6 @@ function showResult(data) {
 
                 </div>
 
-
                 <div class="meta-item field-wide">
 
                     <h4>
@@ -395,14 +548,11 @@ function showResult(data) {
 
                 </div>
 
-
             </div>
-
 
             <h3>
                 Top Reasons
             </h3>
-
 
             <ul class="reasons-list">
 
@@ -410,24 +560,16 @@ function showResult(data) {
 
             </ul>
 
-
         </div>
-
     `;
-
 
     animateProbability(
         percent,
         900
     );
 
-
-    // IMPORTANT:
-    //
-    // /predict no longer generates SHAP.
-    //
-    // Therefore do NOT automatically call
-    // showExplanation() here.
+    // /predict does not generate SHAP.
+    // SHAP is generated only by /explain.
 }
 
 
@@ -447,60 +589,74 @@ explainBtn.onclick = async () => {
         explainBtn
     );
 
-
     try {
 
         const data =
             collectFormData();
 
         console.log(
-            "Sending explain request:",
+            "[Explain] Sending explain request:",
             data
         );
 
-
-        const result = await apiRequest(
-            "/explain",
-            data,
-            90000
-        );
-
+        const result =
+            await apiRequest(
+                "/explain",
+                data,
+                API_TIMEOUT
+            );
 
         console.log(
-            "Explanation payload:",
+            "[Explain] Explanation payload:",
             result
         );
 
-
-        showExplanation(
-            result
-        );
-
+        showExplanation(result);
 
     } catch (err) {
 
         console.error(
-            "Explain error:",
+            "[Explain] Explanation error:",
             err
         );
 
+        let message =
+            err.message ||
+            "Unexpected explanation error.";
+
+        if (
+            err.code === "TIMEOUT"
+        ) {
+
+            message =
+                "The SHAP explanation timed out after 120 seconds.";
+
+        } else if (
+            err.code === "NETWORK_ERROR"
+        ) {
+
+            message =
+                "The browser could not reach the Render backend.";
+
+        } else if (
+            err.status
+        ) {
+
+            message =
+                `Backend error (HTTP ${err.status}): ${message}`;
+        }
 
         showError(
             explanationDiv,
             "Explanation Failed",
-            err.message
+            message
         );
-
 
     } finally {
 
-        clearTimeout(
-            timeout
-        );
-
-        setLoading(
-            false
-        );
+        // Do not use clearTimeout(timeout) here.
+        // apiRequest() manages its own timeout.
+        setLoading(false);
     }
 };
 
@@ -512,7 +668,6 @@ explainBtn.onclick = async () => {
 function initStates() {
 
     loading.hidden = true;
-
 
     explanationDiv.innerHTML = `
 
@@ -546,7 +701,6 @@ function setLoading(
     loading.hidden =
         !isLoading;
 
-
     if (
         isLoading &&
         message
@@ -556,13 +710,11 @@ function setLoading(
             message;
     }
 
-
     predictBtn.disabled =
         isLoading;
 
     explainBtn.disabled =
         isLoading;
-
 
     [
         predictBtn,
@@ -576,7 +728,6 @@ function setLoading(
 
         }
     );
-
 
     if (
         isLoading &&
@@ -601,24 +752,20 @@ function collectFormData() {
             new FormData(form)
         );
 
-
     data.tenure =
         Number(
             data.tenure
         );
-
 
     data.MonthlyCharges =
         Number(
             data.MonthlyCharges
         );
 
-
     data.TotalCharges =
         Number(
             data.TotalCharges
         );
-
 
     return data;
 }
@@ -637,7 +784,6 @@ function normalizeProbability(
             rawProbability || 0
         );
 
-
     if (
         Number.isNaN(
             numeric
@@ -646,7 +792,6 @@ function normalizeProbability(
 
         return 0;
     }
-
 
     if (
         numeric > 1
@@ -660,7 +805,6 @@ function normalizeProbability(
             1
         );
     }
-
 
     return Math.min(
         Math.max(
@@ -700,7 +844,6 @@ function getRiskInfo(
         };
     }
 
-
     if (
         percent < 75
     ) {
@@ -720,7 +863,6 @@ function getRiskInfo(
                 "Customer has moderate churn probability"
         };
     }
-
 
     return {
 
@@ -758,7 +900,6 @@ function animateProbability(
             "riskPercentText"
         );
 
-
     if (
         !radial ||
         !label
@@ -766,7 +907,6 @@ function animateProbability(
 
         return;
     }
-
 
     const clampedTarget =
         Math.min(
@@ -777,24 +917,21 @@ function animateProbability(
             100
         );
 
-
     const start =
         performance.now();
-
 
     const tick =
         (timestamp) => {
 
             const elapsed =
-                timestamp - start;
-
+                timestamp -
+                start;
 
             const progress =
                 Math.min(
                     elapsed / duration,
                     1
                 );
-
 
             const eased =
                 1 -
@@ -803,21 +940,17 @@ function animateProbability(
                     3
                 );
 
-
             const current =
                 clampedTarget *
                 eased;
-
 
             radial.style.setProperty(
                 "--progress",
                 current.toFixed(1)
             );
 
-
             label.textContent =
                 `${current.toFixed(1)}%`;
-
 
             if (
                 progress < 1
@@ -828,7 +961,6 @@ function animateProbability(
                 );
             }
         };
-
 
     requestAnimationFrame(
         tick
@@ -848,7 +980,6 @@ function showExplanation(
         result.prediction_explanation ||
         result;
 
-
     const positiveFactors =
         Array.isArray(
             explanation.positive_factors
@@ -857,7 +988,6 @@ function showExplanation(
             ? explanation.positive_factors
 
             : [];
-
 
     const negativeFactors =
         Array.isArray(
@@ -868,7 +998,6 @@ function showExplanation(
 
             : [];
 
-
     const neutralFactors =
         Array.isArray(
             explanation.neutral_factors
@@ -877,7 +1006,6 @@ function showExplanation(
             ? explanation.neutral_factors
 
             : [];
-
 
     const features =
         Array.isArray(
@@ -888,17 +1016,14 @@ function showExplanation(
 
             : [];
 
-
     const summary =
         explanation.summary ||
         result.message ||
         "Explanation generated successfully.";
 
-
     const finalReason =
         explanation.final_reason ||
         "No detailed final reason provided.";
-
 
     explanationDiv.innerHTML = `
 
@@ -916,11 +1041,9 @@ function showExplanation(
 
         </div>
 
-
         <div
             class="explanation-body result-shell"
         >
-
 
             <div class="explain-block">
 
@@ -936,7 +1059,6 @@ function showExplanation(
 
             </div>
 
-
             <div class="explain-block">
 
                 <h4>
@@ -950,7 +1072,6 @@ function showExplanation(
                 )}
 
             </div>
-
 
             <div class="explain-block">
 
@@ -966,7 +1087,6 @@ function showExplanation(
 
             </div>
 
-
             <div class="explain-block">
 
                 <h4>
@@ -981,7 +1101,6 @@ function showExplanation(
 
             </div>
 
-
             <div class="explain-block">
 
                 <h4>
@@ -993,7 +1112,6 @@ function showExplanation(
                 )}
 
             </div>
-
 
         </div>
 
@@ -1026,7 +1144,6 @@ function renderFactorList(
         `;
     }
 
-
     return `
 
         <div class="chip-list">
@@ -1047,29 +1164,36 @@ function renderFactorList(
                             item.impact ||
                             "";
 
-
                         return `
 
                             <span
                                 class="chip ${className}"
                             >
+
                                 ${escapeHTML(
                                     feature
                                 )}
 
-                                ${value
-                                    ? `: ${escapeHTML(
-                                        String(value)
-                                    )}`
-                                    : ""
+                                ${
+                                    value
+                                        ? `: ${escapeHTML(
+                                            String(
+                                                value
+                                            )
+                                        )}`
+                                        : ""
                                 }
 
-                                ${impact
-                                    ? ` (${escapeHTML(
-                                        String(impact)
-                                    )})`
-                                    : ""
+                                ${
+                                    impact
+                                        ? ` (${escapeHTML(
+                                            String(
+                                                impact
+                                            )
+                                        )})`
+                                        : ""
                                 }
+
                             </span>
 
                         `;
@@ -1104,10 +1228,12 @@ function renderFeatureRows(
         `;
     }
 
-
     const rows =
         features
-            .slice(0, 9)
+            .slice(
+                0,
+                9
+            )
             .map(
                 (entry) => {
 
@@ -1119,7 +1245,6 @@ function renderFeatureRows(
                             )
                         );
 
-
                     const value =
                         escapeHTML(
                             String(
@@ -1128,13 +1253,11 @@ function renderFeatureRows(
                             )
                         );
 
-
                     const shapValue =
                         Number(
                             entry.shap_value ||
                             0
                         );
-
 
                     const contribution =
                         Number(
@@ -1142,26 +1265,27 @@ function renderFeatureRows(
                             0
                         );
 
-
                     const formatted =
                         Number.isFinite(
                             shapValue
                         )
 
-                            ? shapValue.toFixed(4)
+                            ? shapValue.toFixed(
+                                4
+                            )
 
                             : "N/A";
-
 
                     const contributionText =
                         Number.isFinite(
                             contribution
                         )
 
-                            ? `${contribution.toFixed(2)} pp`
+                            ? `${contribution.toFixed(
+                                2
+                            )} pp`
 
                             : "N/A";
-
 
                     const impact =
                         escapeHTML(
@@ -1170,7 +1294,6 @@ function renderFeatureRows(
                                 "Unknown"
                             )
                         );
-
 
                     return `
 
@@ -1203,7 +1326,6 @@ function renderFeatureRows(
                 }
             )
             .join("");
-
 
     return `
 
@@ -1244,7 +1366,6 @@ function showError(
 
         </div>
 
-
         <div class="error-card">
 
             <p>
@@ -1268,7 +1389,9 @@ function escapeHTML(
     value
 ) {
 
-    return String(value)
+    return String(
+        value
+    )
 
         .replace(
             /&/g,

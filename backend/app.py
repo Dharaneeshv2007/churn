@@ -1,39 +1,73 @@
-
 import logging
 import os
+import time
 from threading import Lock
 
 # ============================================================
-# TensorFlow CPU settings
+# TENSORFLOW CPU SETTINGS
 # ============================================================
-# Render normally runs without a GPU. Limit CPU thread usage so
-# TensorFlow does not consume the whole small Render instance.
+# Render normally runs without a GPU.
+# Keep TensorFlow CPU execution predictable and lightweight.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import joblib
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 
-from utils.preprocessing import preprocess_data, load_and_prepare_data
+
+# ============================================================
+# TENSORFLOW THREAD CONFIGURATION
+# ============================================================
+# These must be configured before TensorFlow starts doing work.
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    # TensorFlow may already have initialized its thread pools.
+    pass
+
+
+# ============================================================
+# PROJECT IMPORTS
+# ============================================================
+from utils.preprocessing import (
+    preprocess_data,
+    load_and_prepare_data,
+)
+
 from utils.shap_explainer import (
     SHAP_BACKGROUND_SIZE,
     ShapExplanationError,
     build_prediction_explanation,
 )
-from utils.recommendation import get_recommendation
-from utils.clv import calculate_clv
 
+from utils.recommendation import (
+    get_recommendation,
+)
+
+from utils.clv import (
+    calculate_clv,
+)
+
+
+# ============================================================
+# TRAINING IMPORTS
+# ============================================================
 # Training is available only when explicitly enabled.
 from model.lstm_model import (
     build_lstm_model,
     train_lstm_model,
     evaluate_model as eval_lstm,
 )
+
 from model.gru_model import (
     build_gru_model,
     train_gru_model,
@@ -70,12 +104,17 @@ default_origins = [
 
 env_origins = [
     x.strip().rstrip("/")
-    for x in os.getenv("FRONTEND_ORIGIN", "").split(",")
+    for x in os.getenv(
+        "FRONTEND_ORIGIN",
+        "",
+    ).split(",")
     if x.strip()
 ]
 
 ALLOWED_ORIGINS = list(
-    dict.fromkeys(default_origins + env_origins)
+    dict.fromkeys(
+        default_origins + env_origins
+    )
 )
 
 CORS(
@@ -85,8 +124,15 @@ CORS(
             "origins": ALLOWED_ORIGINS
         }
     },
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    methods=[
+        "GET",
+        "POST",
+        "OPTIONS",
+    ],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+    ],
     supports_credentials=False,
 )
 
@@ -94,7 +140,9 @@ CORS(
 # ============================================================
 # PATHS
 # ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
 
 DATA_PATH = os.path.join(
     BASE_DIR,
@@ -137,8 +185,22 @@ REFERENCE_STATS = {}
 FEATURE_NAMES = None
 SHAP_BACKGROUND_X = None
 
-# Prevent multiple expensive SHAP calculations at once.
+
+# ============================================================
+# LOCKS
+# ============================================================
+# SHAP can be computationally expensive.
 SHAP_LOCK = Lock()
+
+# IMPORTANT:
+# TensorFlow inference is also protected by a lock.
+#
+# This prevents two requests from entering the same loaded
+# TensorFlow model simultaneously.
+#
+# This is especially important because Gunicorn may use
+# multiple threads.
+PREDICT_LOCK = Lock()
 
 
 # ============================================================
@@ -158,38 +220,48 @@ REQUIRED_FIELDS = {
 
 
 # ============================================================
-# MODEL INPUT HELPERS
+# MODEL INPUT HELPER
 # ============================================================
 def _model_input(model, X):
     """
     Convert preprocessed customer data to the input shape
     expected by the trained LSTM/GRU model.
 
-    Most preprocessing returns a 2D array:
-        (samples, features)
+    Current production model:
+        (None, 16, 1)
 
-    LSTM/GRU models generally expect:
-        (samples, timesteps, features)
+    Preprocessing output:
+        (1, 16)
 
-    If the loaded model has a 3D input shape, reshape safely.
+    Therefore:
+        (1, 16) -> (1, 16, 1)
     """
 
-    X = np.asarray(X, dtype=np.float32)
+    X = np.asarray(
+        X,
+        dtype=np.float32,
+    )
 
-    input_shape = getattr(model, "input_shape", None)
+    input_shape = getattr(
+        model,
+        "input_shape",
+        None,
+    )
 
     if input_shape is None:
         return X
 
-    # Example:
-    # model.input_shape = (None, 19, 1)
-    if len(input_shape) == 3 and X.ndim == 2:
+    # --------------------------------------------------------
+    # 3D model input
+    # --------------------------------------------------------
+    if (
+        len(input_shape) == 3
+        and X.ndim == 2
+    ):
 
         expected_features = input_shape[-2]
         expected_channels = input_shape[-1]
 
-        # Normal case for this project:
-        # (samples, features) -> (samples, features, 1)
         if (
             expected_channels == 1
             and (
@@ -203,7 +275,7 @@ def _model_input(model, X):
                 1,
             )
 
-        # Generic fallback when the number of dimensions is right.
+        # Safe fallback.
         return X.reshape(
             X.shape[0],
             X.shape[1],
@@ -213,26 +285,134 @@ def _model_input(model, X):
     return X
 
 
+# ============================================================
+# DIRECT TENSORFLOW INFERENCE
+# ============================================================
 def _predict_probability(model, X):
     """
-    Perform a single model prediction and return a safe
-    probability between 0 and 1.
+    Perform one fast TensorFlow forward pass.
 
     IMPORTANT:
-    This function is defined BEFORE _load_artifacts()
-    because startup warm-up uses it.
+    We intentionally DO NOT use:
+
+        model.predict()
+
+    The production logs showed that model.predict() can hang
+    on the Render worker.
+
+    Instead we directly call the model:
+
+        model(model_X, training=False)
+
+    This is the actual neural-network forward pass and avoids
+    the extra Keras predict machinery.
     """
 
     if model is None:
-        raise RuntimeError("Prediction model is not loaded")
+        raise RuntimeError(
+            "Prediction model is not loaded"
+        )
 
-    model_X = _model_input(model, X)
-
-    prediction = model.predict(
-        model_X,
-        verbose=0,
+    # --------------------------------------------------------
+    # Prepare input
+    # --------------------------------------------------------
+    model_X = _model_input(
+        model,
+        X,
     )
 
+    model_X = np.asarray(
+        model_X,
+        dtype=np.float32,
+    )
+
+    logger.info(
+        "[INFERENCE] Input prepared: shape=%s dtype=%s",
+        model_X.shape,
+        model_X.dtype,
+    )
+
+    # --------------------------------------------------------
+    # Validate shape
+    # --------------------------------------------------------
+    expected_shape = getattr(
+        model,
+        "input_shape",
+        None,
+    )
+
+    if expected_shape is not None:
+
+        logger.info(
+            "[INFERENCE] Model expected input shape: %s",
+            expected_shape,
+        )
+
+        if (
+            len(expected_shape) == 3
+            and model_X.ndim != 3
+        ):
+            raise RuntimeError(
+                "Prepared model input is not 3-dimensional"
+            )
+
+    # --------------------------------------------------------
+    # Direct TensorFlow forward pass
+    # --------------------------------------------------------
+    started = time.perf_counter()
+
+    logger.info(
+        "[INFERENCE] Starting direct model call"
+    )
+
+    with PREDICT_LOCK:
+
+        try:
+            prediction_tensor = model(
+                model_X,
+                training=False,
+            )
+
+        except Exception as error:
+            logger.exception(
+                "[INFERENCE] TensorFlow model call failed: %s",
+                error,
+            )
+            raise
+
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
+    logger.info(
+        "[INFERENCE] Direct model call completed in %.4f seconds",
+        elapsed,
+    )
+
+    # --------------------------------------------------------
+    # Convert TensorFlow tensor to NumPy
+    # --------------------------------------------------------
+    try:
+        prediction = (
+            prediction_tensor.numpy()
+        )
+
+    except Exception as error:
+        logger.exception(
+            "[INFERENCE] Tensor-to-NumPy conversion failed: %s",
+            error,
+        )
+        raise
+
+    logger.info(
+        "[INFERENCE] Tensor converted to NumPy: shape=%s",
+        np.asarray(prediction).shape,
+    )
+
+    # --------------------------------------------------------
+    # Extract probability
+    # --------------------------------------------------------
     values = np.asarray(
         prediction,
         dtype=np.float32,
@@ -243,27 +423,43 @@ def _predict_probability(model, X):
             "Model returned an empty prediction"
         )
 
-    value = float(values[0])
+    value = float(
+        values[0]
+    )
 
     if not np.isfinite(value):
         raise RuntimeError(
             "Model returned an invalid probability"
         )
 
-    return float(
-        np.clip(value, 0.0, 1.0)
+    value = float(
+        np.clip(
+            value,
+            0.0,
+            1.0,
+        )
     )
+
+    logger.info(
+        "[INFERENCE] Final probability: %.6f",
+        value,
+    )
+
+    return value
 
 
 # ============================================================
 # MODEL WARM-UP
 # ============================================================
-def _warm_up_model(model, reference_x):
+def _warm_up_model(
+    model,
+    reference_x,
+):
     """
-    Run one prediction after loading the model.
+    Warm up the model using the EXACT SAME direct inference
+    method used by /predict.
 
-    This moves TensorFlow's first-call initialization cost
-    to server startup instead of the first customer request.
+    This moves TensorFlow initialization work to startup.
     """
 
     if model is None:
@@ -281,24 +477,36 @@ def _warm_up_model(model, reference_x):
         dtype=np.float32,
     )
 
-    if reference_x.ndim != 2 or reference_x.shape[0] == 0:
+    if (
+        reference_x.ndim != 2
+        or reference_x.shape[0] == 0
+    ):
         raise RuntimeError(
             "Invalid reference data for model warm-up"
         )
 
-    # Use a real preprocessed sample rather than an arbitrary
-    # zero vector. This guarantees the feature shape matches
-    # the preprocessing pipeline.
     warm = reference_x[:1]
+
+    logger.info(
+        "[WARMUP] Starting TensorFlow inference warm-up"
+    )
+
+    started = time.perf_counter()
 
     probability = _predict_probability(
         model,
         warm,
     )
 
+    elapsed = (
+        time.perf_counter()
+        - started
+    )
+
     logger.info(
-        "Model warm-up successful. probability=%.6f",
+        "[WARMUP] Model warm-up successful. probability=%.6f time=%.4fs",
         probability,
+        elapsed,
     )
 
 
@@ -307,8 +515,8 @@ def _warm_up_model(model, reference_x):
 # ============================================================
 def _load_artifacts():
     """
-    Load model, scaler, encoder and reference data once
-    when the Gunicorn worker starts.
+    Load model, scaler, encoder and reference data once when
+    the Gunicorn worker starts.
 
     Nothing expensive should be repeated for every /predict
     request.
@@ -324,12 +532,29 @@ def _load_artifacts():
     global SHAP_BACKGROUND_X
 
     try:
-        logger.info("Loading model...")
 
-        if not os.path.exists(MODEL_PATH):
+        logger.info(
+            "=================================================="
+        )
+
+        logger.info(
+            "Loading production inference artifacts..."
+        )
+
+        # ----------------------------------------------------
+        # MODEL
+        # ----------------------------------------------------
+        if not os.path.exists(
+            MODEL_PATH
+        ):
             raise FileNotFoundError(
                 f"Model file not found: {MODEL_PATH}"
             )
+
+        logger.info(
+            "Loading model from: %s",
+            MODEL_PATH,
+        )
 
         MODEL = load_model(
             MODEL_PATH,
@@ -338,22 +563,36 @@ def _load_artifacts():
 
         logger.info(
             "Model loaded successfully. input_shape=%s",
-            getattr(MODEL, "input_shape", None),
+            getattr(
+                MODEL,
+                "input_shape",
+                None,
+            ),
         )
 
-        logger.info(
-            "Loading preprocessing artifacts..."
-        )
-
-        if not os.path.exists(SCALER_PATH):
+        # ----------------------------------------------------
+        # SCALER
+        # ----------------------------------------------------
+        if not os.path.exists(
+            SCALER_PATH
+        ):
             raise FileNotFoundError(
                 f"Scaler file not found: {SCALER_PATH}"
             )
 
-        if not os.path.exists(ENCODER_PATH):
+        # ----------------------------------------------------
+        # ENCODER
+        # ----------------------------------------------------
+        if not os.path.exists(
+            ENCODER_PATH
+        ):
             raise FileNotFoundError(
                 f"Encoder file not found: {ENCODER_PATH}"
             )
+
+        logger.info(
+            "Loading preprocessing artifacts..."
+        )
 
         SCALER = joblib.load(
             SCALER_PATH
@@ -367,17 +606,24 @@ def _load_artifacts():
             "Scaler and encoder loaded successfully."
         )
 
-        logger.info(
-            "Loading reference dataset..."
-        )
-
-        if not os.path.exists(DATA_PATH):
+        # ----------------------------------------------------
+        # REFERENCE DATA
+        # ----------------------------------------------------
+        if not os.path.exists(
+            DATA_PATH
+        ):
             raise FileNotFoundError(
                 f"Dataset not found: {DATA_PATH}"
             )
 
-        REFERENCE_DATA = load_and_prepare_data(
-            DATA_PATH
+        logger.info(
+            "Loading reference dataset..."
+        )
+
+        REFERENCE_DATA = (
+            load_and_prepare_data(
+                DATA_PATH
+            )
         )
 
         (
@@ -408,19 +654,40 @@ def _load_artifacts():
         # ----------------------------------------------------
         REFERENCE_STATS = {}
 
-        if "MonthlyCharges" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["MonthlyCharges"] = float(
-                REFERENCE_DATA["MonthlyCharges"].mean()
+        if (
+            "MonthlyCharges"
+            in REFERENCE_DATA.columns
+        ):
+            REFERENCE_STATS[
+                "MonthlyCharges"
+            ] = float(
+                REFERENCE_DATA[
+                    "MonthlyCharges"
+                ].mean()
             )
 
-        if "tenure" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["tenure"] = float(
-                REFERENCE_DATA["tenure"].median()
+        if (
+            "tenure"
+            in REFERENCE_DATA.columns
+        ):
+            REFERENCE_STATS[
+                "tenure"
+            ] = float(
+                REFERENCE_DATA[
+                    "tenure"
+                ].median()
             )
 
-        if "TotalCharges" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["TotalCharges"] = float(
-                REFERENCE_DATA["TotalCharges"].mean()
+        if (
+            "TotalCharges"
+            in REFERENCE_DATA.columns
+        ):
+            REFERENCE_STATS[
+                "TotalCharges"
+            ] = float(
+                REFERENCE_DATA[
+                    "TotalCharges"
+                ].mean()
             )
 
         # ----------------------------------------------------
@@ -449,6 +716,8 @@ def _load_artifacts():
         # ----------------------------------------------------
         # TensorFlow warm-up
         # ----------------------------------------------------
+        # IMPORTANT:
+        # This uses direct model inference, NOT model.predict().
         _warm_up_model(
             MODEL,
             REFERENCE_X,
@@ -457,28 +726,39 @@ def _load_artifacts():
         logger.info(
             "=================================================="
         )
+
         logger.info(
             "ALL INFERENCE ARTIFACTS LOADED SUCCESSFULLY"
         )
+
         logger.info(
             "Features: %d",
             len(FEATURE_NAMES),
         )
+
         logger.info(
             "SHAP background: %d",
             len(SHAP_BACKGROUND_X),
         )
+
+        logger.info(
+            "Prediction engine: Direct TensorFlow inference"
+        )
+
         logger.info(
             "=================================================="
         )
 
     except Exception:
+
         MODEL = None
         SCALER = None
         ENCODER = None
+
         REFERENCE_DATA = None
         REFERENCE_X = None
         REFERENCE_STATS = {}
+
         FEATURE_NAMES = None
         SHAP_BACKGROUND_X = None
 
@@ -496,7 +776,10 @@ _load_artifacts()
 # ============================================================
 # ERROR RESPONSE
 # ============================================================
-def _error_response(message, status):
+def _error_response(
+    message,
+    status,
+):
     return jsonify({
         "error": message
     }), status
@@ -506,7 +789,11 @@ def _error_response(message, status):
 # CUSTOMER VALIDATION
 # ============================================================
 def _validate_customer(data):
-    if not isinstance(data, dict) or not data:
+
+    if (
+        not isinstance(data, dict)
+        or not data
+    ):
         raise ValueError(
             "Request body must be a non-empty JSON object"
         )
@@ -521,30 +808,43 @@ def _validate_customer(data):
             + ", ".join(missing)
         )
 
+    # --------------------------------------------------------
     # Numeric validation
+    # --------------------------------------------------------
     for name in (
         "SeniorCitizen",
         "tenure",
         "MonthlyCharges",
         "TotalCharges",
     ):
+
         try:
-            value = float(data[name])
+            value = float(
+                data[name]
+            )
+
         except (
             TypeError,
             ValueError,
         ):
+
             raise ValueError(
                 f"{name} must be numeric"
             ) from None
 
-        if not np.isfinite(value):
+        if not np.isfinite(
+            value
+        ):
             raise ValueError(
                 f"{name} must be finite"
             )
 
-    # SeniorCitizen must be binary.
-    if float(data["SeniorCitizen"]) not in (
+    # --------------------------------------------------------
+    # SeniorCitizen
+    # --------------------------------------------------------
+    if float(
+        data["SeniorCitizen"]
+    ) not in (
         0.0,
         1.0,
     ):
@@ -552,7 +852,9 @@ def _validate_customer(data):
             "SeniorCitizen must be 0 or 1"
         )
 
-    # Reasonable limits.
+    # --------------------------------------------------------
+    # Tenure
+    # --------------------------------------------------------
     if (
         float(data["tenure"]) < 0
         or float(data["tenure"]) > 1000
@@ -561,6 +863,9 @@ def _validate_customer(data):
             "tenure must be between 0 and 1000 months"
         )
 
+    # --------------------------------------------------------
+    # Charges
+    # --------------------------------------------------------
     if (
         float(data["MonthlyCharges"]) < 0
         or float(data["TotalCharges"]) < 0
@@ -569,8 +874,9 @@ def _validate_customer(data):
             "Charges cannot be negative"
         )
 
-    # Validate categorical values against the
-    # categories learned by the saved encoder.
+    # --------------------------------------------------------
+    # Categorical validation
+    # --------------------------------------------------------
     categorical_fields = (
         "gender",
         "Partner",
@@ -580,33 +886,52 @@ def _validate_customer(data):
     )
 
     try:
-        categories = ENCODER.categories_
+        categories = (
+            ENCODER.categories_
+        )
+
     except AttributeError:
+
         raise RuntimeError(
             "Encoder is not initialized correctly"
         )
 
-    for name, allowed_values in zip(
+    for (
+        name,
+        allowed_values,
+    ) in zip(
         categorical_fields,
         categories,
     ):
-        if data[name] not in allowed_values:
+
+        if (
+            data[name]
+            not in allowed_values
+        ):
             raise ValueError(
-                f"Unknown value for {name}: {data[name]}"
+                f"Unknown value for {name}: "
+                f"{data[name]}"
             )
 
 
 # ============================================================
 # CUSTOMER PREPROCESSING
 # ============================================================
-def _load_customer_input(data):
-    _validate_customer(data)
+def _load_customer_input(
+    data
+):
 
-    X, _, _, _, _ = preprocess_data(
-        pd.DataFrame([data]),
-        fit=False,
-        scaler=SCALER,
-        encoder=ENCODER,
+    _validate_customer(
+        data
+    )
+
+    X, _, _, _, _ = (
+        preprocess_data(
+            pd.DataFrame([data]),
+            fit=False,
+            scaler=SCALER,
+            encoder=ENCODER,
+        )
     )
 
     X = np.asarray(
@@ -614,7 +939,10 @@ def _load_customer_input(data):
         dtype=np.float32,
     )
 
-    if X.ndim != 2 or X.shape[0] != 1:
+    if (
+        X.ndim != 2
+        or X.shape[0] != 1
+    ):
         raise ValueError(
             "Invalid preprocessed customer input shape"
         )
@@ -625,8 +953,12 @@ def _load_customer_input(data):
 # ============================================================
 # ROUTE: HOME
 # ============================================================
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"],
+)
 def home():
+
     ready = (
         MODEL is not None
         and SCALER is not None
@@ -648,8 +980,12 @@ def home():
 # ============================================================
 # ROUTE: HEALTH
 # ============================================================
-@app.route("/health", methods=["GET"])
+@app.route(
+    "/health",
+    methods=["GET"],
+)
 def health():
+
     ready = (
         MODEL is not None
         and SCALER is not None
@@ -663,7 +999,9 @@ def health():
             if ready
             else "unhealthy"
         ),
-        "model_loaded": MODEL is not None,
+        "model_loaded": (
+            MODEL is not None
+        ),
         "preprocessing_loaded": (
             SCALER is not None
             and ENCODER is not None
@@ -676,10 +1014,17 @@ def health():
             if FEATURE_NAMES is not None
             else 0
         ),
+        "prediction_engine": (
+            "direct_tensorflow"
+        ),
     }
 
-    return jsonify(response), (
-        200 if ready else 503
+    return jsonify(
+        response
+    ), (
+        200
+        if ready
+        else 503
     )
 
 
@@ -688,28 +1033,47 @@ def health():
 # ============================================================
 @app.route(
     "/predict",
-    methods=["POST", "OPTIONS"],
+    methods=[
+        "POST",
+        "OPTIONS",
+    ],
 )
 def predict():
 
-    # Browser CORS preflight
+    # --------------------------------------------------------
+    # CORS preflight
+    # --------------------------------------------------------
     if request.method == "OPTIONS":
-        logger.info("[PREDICT] OPTIONS preflight received")
+
+        logger.info(
+            "[PREDICT] OPTIONS preflight received"
+        )
+
         return "", 204
 
-    logger.info("[PREDICT] POST request received")
+    request_started = (
+        time.perf_counter()
+    )
+
+    logger.info(
+        "[PREDICT] POST request received"
+    )
 
     try:
+
         # ----------------------------------------------------
-        # 1. Check backend readiness
+        # Backend readiness
         # ----------------------------------------------------
-        logger.info("[PREDICT] Checking backend readiness")
+        logger.info(
+            "[PREDICT] Checking backend readiness"
+        )
 
         if (
             MODEL is None
             or SCALER is None
             or ENCODER is None
         ):
+
             logger.error(
                 "[PREDICT] Backend artifacts are not ready"
             )
@@ -724,7 +1088,7 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # 2. Read JSON
+        # Read JSON
         # ----------------------------------------------------
         logger.info(
             "[PREDICT] Reading request JSON"
@@ -735,6 +1099,7 @@ def predict():
         )
 
         if data is None:
+
             logger.error(
                 "[PREDICT] Request JSON is empty or invalid"
             )
@@ -750,22 +1115,35 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # 3. Preprocess customer input
+        # Preprocessing
         # ----------------------------------------------------
+        preprocessing_started = (
+            time.perf_counter()
+        )
+
         logger.info(
             "[PREDICT] Starting customer preprocessing"
         )
 
-        X = _load_customer_input(data)
+        X = _load_customer_input(
+            data
+        )
+
+        preprocessing_time = (
+            time.perf_counter()
+            - preprocessing_started
+        )
 
         logger.info(
-            "[PREDICT] Customer preprocessing completed. shape=%s dtype=%s",
+            "[PREDICT] Customer preprocessing completed. "
+            "shape=%s dtype=%s time=%.4fs",
             X.shape,
             X.dtype,
+            preprocessing_time,
         )
 
         # ----------------------------------------------------
-        # 4. Prepare model input
+        # Direct TensorFlow prediction
         # ----------------------------------------------------
         logger.info(
             "[PREDICT] Preparing model input"
@@ -777,72 +1155,51 @@ def predict():
         )
 
         logger.info(
-            "[PREDICT] Model input ready. shape=%s dtype=%s",
+            "[PREDICT] Model input ready. "
+            "shape=%s dtype=%s",
             model_X.shape,
             model_X.dtype,
         )
 
-        # ----------------------------------------------------
-        # 5. Run TensorFlow prediction
-        # ----------------------------------------------------
         logger.info(
-            "[PREDICT] Starting model.predict()"
+            "[PREDICT] Starting DIRECT TensorFlow inference"
         )
 
-        prediction = MODEL.predict(
-            model_X,
-            verbose=0,
+        inference_started = (
+            time.perf_counter()
         )
 
-        logger.info(
-            "[PREDICT] model.predict() completed"
+        prob = _predict_probability(
+            MODEL,
+            X,
         )
 
-        # ----------------------------------------------------
-        # 6. Extract probability
-        # ----------------------------------------------------
-        values = np.asarray(
-            prediction,
-            dtype=np.float32,
-        ).reshape(-1)
-
-        if values.size == 0:
-            raise RuntimeError(
-                "Model returned an empty prediction"
-            )
-
-        prob = float(values[0])
-
-        if not np.isfinite(prob):
-            raise RuntimeError(
-                "Model returned an invalid probability"
-            )
-
-        prob = float(
-            np.clip(
-                prob,
-                0.0,
-                1.0,
-            )
+        inference_time = (
+            time.perf_counter()
+            - inference_started
         )
 
         logger.info(
-            "[PREDICT] Probability calculated: %.6f",
-            prob,
+            "[PREDICT] DIRECT TensorFlow inference completed "
+            "in %.4f seconds",
+            inference_time,
         )
 
         # ----------------------------------------------------
-        # 7. Risk classification
+        # Risk classification
         # ----------------------------------------------------
         if prob < 0.4:
+
             risk = "Low"
             time_to_churn = "90+ days"
 
         elif prob < 0.75:
+
             risk = "Medium"
             time_to_churn = "30-90 days"
 
         else:
+
             risk = "High"
             time_to_churn = "15-30 days"
 
@@ -852,7 +1209,7 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # 8. Recommendation
+        # Recommendation
         # ----------------------------------------------------
         logger.info(
             "[PREDICT] Calculating recommendation"
@@ -867,7 +1224,7 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # 9. Customer lifetime value
+        # Customer lifetime value
         # ----------------------------------------------------
         logger.info(
             "[PREDICT] Calculating customer lifetime value"
@@ -884,31 +1241,53 @@ def predict():
         )
 
         # ----------------------------------------------------
-        # 10. Build response
+        # Response
         # ----------------------------------------------------
         response = {
             "churn_probability": round(
                 prob,
                 4,
             ),
+
             "risk_level": risk,
-            "time_to_churn": time_to_churn,
+
+            "time_to_churn": (
+                time_to_churn
+            ),
+
             "customer_value": clv,
+
             "recommendation": action,
+
             "recommended_action": action,
 
-            # SHAP is intentionally NOT executed here.
+            # Explanation is intentionally NOT generated
+            # during prediction.
             "top_reasons": [],
+
             "prediction_explanation": None,
+
+            # Useful diagnostic information.
+            "prediction_time_seconds": round(
+                inference_time,
+                4,
+            ),
         }
+
+        total_time = (
+            time.perf_counter()
+            - request_started
+        )
 
         logger.info(
             "[PREDICT] Response created successfully"
         )
 
-        # ----------------------------------------------------
-        # 11. Return response
-        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Total request processing time: %.4f seconds",
+            total_time,
+        )
+
         logger.info(
             "[PREDICT] Returning HTTP 200 response"
         )
@@ -917,7 +1296,11 @@ def predict():
             response
         ), 200
 
+    # --------------------------------------------------------
+    # Validation errors
+    # --------------------------------------------------------
     except ValueError as error:
+
         logger.warning(
             "[PREDICT] Validation error: %s",
             error,
@@ -928,7 +1311,11 @@ def predict():
             400,
         )
 
+    # --------------------------------------------------------
+    # Unexpected errors
+    # --------------------------------------------------------
     except Exception as error:
+
         logger.exception(
             "[PREDICT] Prediction endpoint failed: %s",
             error,
@@ -939,85 +1326,187 @@ def predict():
             500,
         )
 
+
 # ============================================================
 # ROUTE: EXPLAIN
 # ============================================================
 @app.route(
     "/explain",
-    methods=["POST", "OPTIONS"],
+    methods=[
+        "POST",
+        "OPTIONS",
+    ],
 )
 def explain():
 
-    # Browser CORS preflight
+    # --------------------------------------------------------
+    # CORS preflight
+    # --------------------------------------------------------
     if request.method == "OPTIONS":
+
+        logger.info(
+            "[EXPLAIN] OPTIONS preflight received"
+        )
+
         return "", 204
 
+    logger.info(
+        "[EXPLAIN] POST request received"
+    )
+
+    started = (
+        time.perf_counter()
+    )
+
     try:
+
+        # ----------------------------------------------------
+        # Backend readiness
+        # ----------------------------------------------------
         if (
             MODEL is None
             or SCALER is None
             or ENCODER is None
         ):
+
             return _error_response(
                 "Backend model is not ready. Please try again shortly.",
                 503,
             )
 
+        # ----------------------------------------------------
+        # Read JSON
+        # ----------------------------------------------------
+        logger.info(
+            "[EXPLAIN] Reading request JSON"
+        )
+
         data = request.get_json(
             silent=True
         )
 
-        X = _load_customer_input(data)
+        if data is None:
 
-        if SHAP_BACKGROUND_X is None:
+            return _error_response(
+                "Invalid or empty JSON request body.",
+                400,
+            )
+
+        logger.info(
+            "[EXPLAIN] JSON received"
+        )
+
+        # ----------------------------------------------------
+        # Preprocessing
+        # ----------------------------------------------------
+        logger.info(
+            "[EXPLAIN] Starting customer preprocessing"
+        )
+
+        X = _load_customer_input(
+            data
+        )
+
+        logger.info(
+            "[EXPLAIN] Customer preprocessing completed. "
+            "shape=%s",
+            X.shape,
+        )
+
+        # ----------------------------------------------------
+        # SHAP readiness
+        # ----------------------------------------------------
+        if (
+            SHAP_BACKGROUND_X
+            is None
+        ):
+
             return _error_response(
                 "Explanation background is not ready.",
                 503,
             )
 
         logger.info(
-            "Generating explanation for one customer"
+            "[EXPLAIN] SHAP background ready. size=%d",
+            len(
+                SHAP_BACKGROUND_X
+            ),
         )
 
-        # Only one SHAP calculation at a time.
-        # This prevents multiple users from exhausting
-        # the CPU/memory on a small Render instance.
+        # ----------------------------------------------------
+        # SHAP explanation
+        # ----------------------------------------------------
+        logger.info(
+            "[EXPLAIN] Waiting for SHAP lock"
+        )
+
         with SHAP_LOCK:
 
-            explanation = build_prediction_explanation(
-                MODEL,
-                X,
-                FEATURE_NAMES,
-                input_data=data,
-                reference_stats=REFERENCE_STATS,
-                background_X=SHAP_BACKGROUND_X,
+            logger.info(
+                "[EXPLAIN] SHAP lock acquired"
             )
+
+            explanation = (
+                build_prediction_explanation(
+                    MODEL,
+                    X,
+                    FEATURE_NAMES,
+                    input_data=data,
+                    reference_stats=REFERENCE_STATS,
+                    background_X=SHAP_BACKGROUND_X,
+                )
+            )
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        )
+
+        logger.info(
+            "[EXPLAIN] Explanation completed in %.4f seconds",
+            elapsed,
+        )
 
         return jsonify({
             "message": "Explanation generated",
-            "prediction_explanation": explanation,
+
+            "prediction_explanation": (
+                explanation
+            ),
+
             **explanation,
         }), 200
 
     except ValueError as error:
+
+        logger.warning(
+            "[EXPLAIN] Validation error: %s",
+            error,
+        )
+
         return _error_response(
             str(error),
             400,
         )
 
     except ShapExplanationError as error:
+
         logger.exception(
-            "SHAP explanation failed"
+            "[EXPLAIN] SHAP explanation failed"
         )
 
         return jsonify({
-            "error": "Unable to generate explanation",
+            "error": (
+                "Unable to generate explanation"
+            ),
             "details": str(error),
         }), 500
 
-    except Exception:
+    except Exception as error:
+
         logger.exception(
-            "Unexpected explanation error"
+            "[EXPLAIN] Unexpected explanation error: %s",
+            error,
         )
 
         return _error_response(
@@ -1031,7 +1520,10 @@ def explain():
 # ============================================================
 @app.route(
     "/train",
-    methods=["GET", "POST"],
+    methods=[
+        "GET",
+        "POST",
+    ],
 )
 def train():
 
@@ -1043,6 +1535,7 @@ def train():
         ).lower()
         != "true"
     ):
+
         return _error_response(
             "Training endpoint is disabled in production. "
             "Set ENABLE_TRAINING=true only when needed.",
@@ -1059,30 +1552,40 @@ def train():
     global SHAP_BACKGROUND_X
 
     try:
+
         logger.info(
-            "Starting model training..."
+            "[TRAIN] Starting model training..."
         )
 
+        # ----------------------------------------------------
+        # Load data
+        # ----------------------------------------------------
         df = load_and_prepare_data(
             DATA_PATH
         )
 
-        X, y, scaler, encoder, feature_names = (
-            preprocess_data(
-                df,
-                fit=True,
-            )
+        (
+            X,
+            y,
+            scaler,
+            encoder,
+            feature_names,
+        ) = preprocess_data(
+            df,
+            fit=True,
         )
 
         # ----------------------------------------------------
         # LSTM
         # ----------------------------------------------------
         logger.info(
-            "Training LSTM model..."
+            "[TRAIN] Training LSTM model..."
         )
 
-        lstm_model = build_lstm_model(
-            X.shape[1]
+        lstm_model = (
+            build_lstm_model(
+                X.shape[1]
+            )
         )
 
         train_lstm_model(
@@ -1091,21 +1594,25 @@ def train():
             y,
         )
 
-        lstm_metrics = eval_lstm(
-            lstm_model,
-            X,
-            y,
+        lstm_metrics = (
+            eval_lstm(
+                lstm_model,
+                X,
+                y,
+            )
         )
 
         # ----------------------------------------------------
         # GRU
         # ----------------------------------------------------
         logger.info(
-            "Training GRU model..."
+            "[TRAIN] Training GRU model..."
         )
 
-        gru_model = build_gru_model(
-            X.shape[1]
+        gru_model = (
+            build_gru_model(
+                X.shape[1]
+            )
         )
 
         train_gru_model(
@@ -1114,10 +1621,12 @@ def train():
             y,
         )
 
-        gru_metrics = eval_gru(
-            gru_model,
-            X,
-            y,
+        gru_metrics = (
+            eval_gru(
+                gru_model,
+                X,
+                y,
+            )
         )
 
         # ----------------------------------------------------
@@ -1127,17 +1636,31 @@ def train():
             lstm_metrics["f1"]
             >= gru_metrics["f1"]
         ):
-            best_model = lstm_model
-            best_metrics = lstm_metrics
+
+            best_model = (
+                lstm_model
+            )
+
+            best_metrics = (
+                lstm_metrics
+            )
+
             best_name = "LSTM"
 
         else:
-            best_model = gru_model
-            best_metrics = gru_metrics
+
+            best_model = (
+                gru_model
+            )
+
+            best_metrics = (
+                gru_metrics
+            )
+
             best_name = "GRU"
 
         logger.info(
-            "Best model selected: %s",
+            "[TRAIN] Best model selected: %s",
             best_name,
         )
 
@@ -1164,7 +1687,7 @@ def train():
         )
 
         # ----------------------------------------------------
-        # Reload production artifacts
+        # Reload production model
         # ----------------------------------------------------
         MODEL = load_model(
             MODEL_PATH,
@@ -1199,22 +1722,40 @@ def train():
         # ----------------------------------------------------
         REFERENCE_STATS = {}
 
-        if "MonthlyCharges" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["MonthlyCharges"] = float(
+        if (
+            "MonthlyCharges"
+            in REFERENCE_DATA.columns
+        ):
+
+            REFERENCE_STATS[
+                "MonthlyCharges"
+            ] = float(
                 REFERENCE_DATA[
                     "MonthlyCharges"
                 ].mean()
             )
 
-        if "tenure" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["tenure"] = float(
+        if (
+            "tenure"
+            in REFERENCE_DATA.columns
+        ):
+
+            REFERENCE_STATS[
+                "tenure"
+            ] = float(
                 REFERENCE_DATA[
                     "tenure"
                 ].median()
             )
 
-        if "TotalCharges" in REFERENCE_DATA.columns:
-            REFERENCE_STATS["TotalCharges"] = float(
+        if (
+            "TotalCharges"
+            in REFERENCE_DATA.columns
+        ):
+
+            REFERENCE_STATS[
+                "TotalCharges"
+            ] = float(
                 REFERENCE_DATA[
                     "TotalCharges"
                 ].mean()
@@ -1242,18 +1783,23 @@ def train():
         )
 
         logger.info(
-            "Training and production artifact refresh completed."
+            "[TRAIN] Training and production artifact "
+            "refresh completed."
         )
 
         return jsonify({
-            "status": "Model trained successfully",
+            "status": (
+                "Model trained successfully"
+            ),
             "model": best_name,
             "metrics": best_metrics,
         }), 200
 
-    except Exception:
+    except Exception as error:
+
         logger.exception(
-            "Training failed"
+            "[TRAIN] Training failed: %s",
+            error,
         )
 
         return _error_response(
@@ -1266,6 +1812,7 @@ def train():
 # LOCAL DEVELOPMENT
 # ============================================================
 if __name__ == "__main__":
+
     port = int(
         os.environ.get(
             "PORT",
@@ -1277,5 +1824,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         debug=False,
+        threaded=False,
     )
-

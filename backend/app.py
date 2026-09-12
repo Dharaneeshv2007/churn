@@ -694,36 +694,145 @@ def predict():
 
     # Browser CORS preflight
     if request.method == "OPTIONS":
+        logger.info("[PREDICT] OPTIONS preflight received")
         return "", 204
 
+    logger.info("[PREDICT] POST request received")
+
     try:
-        # Check backend readiness.
+        # ----------------------------------------------------
+        # 1. Check backend readiness
+        # ----------------------------------------------------
+        logger.info("[PREDICT] Checking backend readiness")
+
         if (
             MODEL is None
             or SCALER is None
             or ENCODER is None
         ):
+            logger.error(
+                "[PREDICT] Backend artifacts are not ready"
+            )
+
             return _error_response(
                 "Backend model is not ready. Please try again shortly.",
                 503,
             )
 
+        logger.info(
+            "[PREDICT] Backend artifacts are ready"
+        )
+
+        # ----------------------------------------------------
+        # 2. Read JSON
+        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Reading request JSON"
+        )
+
         data = request.get_json(
             silent=True
         )
 
+        if data is None:
+            logger.error(
+                "[PREDICT] Request JSON is empty or invalid"
+            )
+
+            return _error_response(
+                "Invalid or empty JSON request body.",
+                400,
+            )
+
+        logger.info(
+            "[PREDICT] JSON received. Fields=%s",
+            list(data.keys()),
+        )
+
+        # ----------------------------------------------------
+        # 3. Preprocess customer input
+        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Starting customer preprocessing"
+        )
+
         X = _load_customer_input(data)
 
-        # IMPORTANT:
-        # Prediction does NOT call SHAP.
-        # This keeps /predict fast.
-        prob = _predict_probability(
+        logger.info(
+            "[PREDICT] Customer preprocessing completed. shape=%s dtype=%s",
+            X.shape,
+            X.dtype,
+        )
+
+        # ----------------------------------------------------
+        # 4. Prepare model input
+        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Preparing model input"
+        )
+
+        model_X = _model_input(
             MODEL,
             X,
         )
 
+        logger.info(
+            "[PREDICT] Model input ready. shape=%s dtype=%s",
+            model_X.shape,
+            model_X.dtype,
+        )
+
         # ----------------------------------------------------
-        # Risk classification
+        # 5. Run TensorFlow prediction
+        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Starting model.predict()"
+        )
+
+        prediction = MODEL.predict(
+            model_X,
+            verbose=0,
+        )
+
+        logger.info(
+            "[PREDICT] model.predict() completed"
+        )
+
+        # ----------------------------------------------------
+        # 6. Extract probability
+        # ----------------------------------------------------
+        values = np.asarray(
+            prediction,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if values.size == 0:
+            raise RuntimeError(
+                "Model returned an empty prediction"
+            )
+
+        prob = float(values[0])
+
+        if not np.isfinite(prob):
+            raise RuntimeError(
+                "Model returned an invalid probability"
+            )
+
+        prob = float(
+            np.clip(
+                prob,
+                0.0,
+                1.0,
+            )
+        )
+
+        logger.info(
+            "[PREDICT] Probability calculated: %.6f",
+            prob,
+        )
+
+        # ----------------------------------------------------
+        # 7. Risk classification
         # ----------------------------------------------------
         if prob < 0.4:
             risk = "Low"
@@ -737,21 +846,46 @@ def predict():
             risk = "High"
             time_to_churn = "15-30 days"
 
+        logger.info(
+            "[PREDICT] Risk calculated: %s",
+            risk,
+        )
+
         # ----------------------------------------------------
-        # Recommendation
+        # 8. Recommendation
         # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Calculating recommendation"
+        )
+
         action = get_recommendation(
             risk
         )
 
+        logger.info(
+            "[PREDICT] Recommendation completed"
+        )
+
         # ----------------------------------------------------
-        # Customer lifetime value
+        # 9. Customer lifetime value
         # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Calculating customer lifetime value"
+        )
+
         clv = calculate_clv(
             data["tenure"],
             data["MonthlyCharges"],
         )
 
+        logger.info(
+            "[PREDICT] CLV completed: %s",
+            clv,
+        )
+
+        # ----------------------------------------------------
+        # 10. Build response
+        # ----------------------------------------------------
         response = {
             "churn_probability": round(
                 prob,
@@ -763,30 +897,47 @@ def predict():
             "recommendation": action,
             "recommended_action": action,
 
-            # Explanation is intentionally generated
-            # only when /explain is requested.
+            # SHAP is intentionally NOT executed here.
             "top_reasons": [],
             "prediction_explanation": None,
         }
 
-        return jsonify(response), 200
+        logger.info(
+            "[PREDICT] Response created successfully"
+        )
+
+        # ----------------------------------------------------
+        # 11. Return response
+        # ----------------------------------------------------
+        logger.info(
+            "[PREDICT] Returning HTTP 200 response"
+        )
+
+        return jsonify(
+            response
+        ), 200
 
     except ValueError as error:
+        logger.warning(
+            "[PREDICT] Validation error: %s",
+            error,
+        )
+
         return _error_response(
             str(error),
             400,
         )
 
-    except Exception:
+    except Exception as error:
         logger.exception(
-            "Prediction endpoint failed"
+            "[PREDICT] Prediction endpoint failed: %s",
+            error,
         )
 
         return _error_response(
             "Prediction failed. Please try again.",
             500,
         )
-
 
 # ============================================================
 # ROUTE: EXPLAIN
